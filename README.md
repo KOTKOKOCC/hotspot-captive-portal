@@ -1,4 +1,4 @@
-# Hotspot Auth Portal
+# Hotspot Captive Portal
 
 Backend и админ-панель для гостевого Wi-Fi:
 - авторизация по номеру телефона
