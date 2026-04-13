@@ -46,6 +46,8 @@ exten => s,1,NoOp(Hotspot verification call)
  same => n,Hangup()
 ```
 
+`IP_ADDRESS_BACKEND` необходимо заменить адресом своего backend'а
+
 Перезагрузить dialplan:
 
 ```bash
