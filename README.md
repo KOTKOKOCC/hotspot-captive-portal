@@ -22,7 +22,7 @@ Backend и админ-панель для гостевого Wi-Fi:
 git clone <repo_url>
 cd hotspot-captive-portal
 bash setup.sh
-
+```
 ## Интеграции
 
 Для работы нужно подключить:
@@ -37,3 +37,4 @@ bash setup.sh
 
 Открыть:
 - `/admin/login`
+
