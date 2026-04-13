@@ -20,7 +20,7 @@ Backend и админ-панель для гостевого Wi-Fi:
 
 ```bash
 git clone <repo_url>
-cd hotspot-auth
+cd hotspot-captive-portal
 bash install.sh
 source .venv/bin/activate
 python -m uvicorn app:app --host 0.0.0.0 --port 8000
