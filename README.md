@@ -30,8 +30,8 @@ bash setup.sh
 - АТС для подтверждения звонка
 
 Подробнее:
-- `[MikroTik integration](docs/mikrotik.md)`
-- `[PBX integration](docs/pbx.md)`
+- [MikroTik integration](docs/mikrotik.md)
+- [PBX integration](docs/pbx.md)
 
 ## Вход в админку
 
