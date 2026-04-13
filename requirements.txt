@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+pydantic
+openpyxl
+routeros-api
+python-multipart

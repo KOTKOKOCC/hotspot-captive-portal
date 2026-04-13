@@ -1,0 +1,15 @@
+[Unit]
+Description=Hotspot Auth Portal
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/hotspot-auth
+ExecStart=/opt/hotspot-auth/.venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
