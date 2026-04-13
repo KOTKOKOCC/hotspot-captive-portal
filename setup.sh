@@ -95,7 +95,9 @@ echo ".env created successfully."
 echo
 
 read -r -p "Start backend now? [y/N]: " START_NOW
-if [[ "$START_NOW" =~ ^[Yy]$ ]]; then
+START_NOW="$(printf '%s' "$START_NOW" | tr '[:upper:]' '[:lower:]')"
+
+if [[ "$START_NOW" == "y" || "$START_NOW" == "yes" || "$START_NOW" == "да" ]]; then
   exec python -m uvicorn app:app --host 0.0.0.0 --port 8000
 fi
 
