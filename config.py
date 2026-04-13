@@ -3,7 +3,7 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 
-APP_NAME = os.getenv("APP_NAME", "Miracleon Captive Portal")
+APP_NAME = os.getenv("APP_NAME", "C-Portal")
 DB_PATH = os.getenv("DB_PATH", str(BASE_DIR / "hotspot.db"))
 
 APP_SECRET = os.getenv("APP_SECRET", "change_me")
