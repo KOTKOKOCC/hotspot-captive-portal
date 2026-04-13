@@ -19,7 +19,7 @@ Backend и админ-панель для гостевого Wi-Fi:
 ## Быстрый старт
 
 ```bash
-git clone <repo_url>
+git clone https://github.com/KOTKOKOCC/hotspot-captive-portal.git
 cd hotspot-captive-portal
 bash setup.sh
 ```
@@ -30,8 +30,8 @@ bash setup.sh
 - АТС для подтверждения звонка
 
 Подробнее:
-- `docs/mikrotik.md`
-- `docs/pbx.md`
+- `[MikroTik integration](docs/mikrotik.md)`
+- `[PBX integration](docs/pbx.md)`
 
 ## Вход в админку
 
