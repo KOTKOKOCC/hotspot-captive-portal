@@ -22,3 +22,18 @@ Backend и админ-панель для гостевого Wi-Fi:
 git clone <repo_url>
 cd hotspot-captive-portal
 bash setup.sh
+
+## Интеграции
+
+Для работы нужно подключить:
+- MikroTik Hotspot / RADIUS
+- АТС для подтверждения звонка
+
+Подробнее:
+- `docs/mikrotik.md`
+- `docs/pbx.md`
+
+## Вход в админку
+
+Открыть:
+- `/admin/login`
