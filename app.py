@@ -825,13 +825,20 @@ def admin_audit():
 
 
 @app.get("/admin/networks", response_class=HTMLResponse)
-def admin_networks(request: Request, error: str = "", ok: str = ""):
+def admin_networks(request: Request, error: str = "", ok: str = "", edit_id: str = ""):
     guard = admin_guard(request)
     if guard:
         return guard
 
-    rows = fetch_all("SELECT * FROM network_map ORDER BY CAST(COALESCE(vlan_id, '0') AS INTEGER), hotel_name, ssid_name")
-    cols = ["id", "hotel_name", "ssid_name", "vlan_id", "subnet_cidr", "mikrotik_interface", "hotspot_server", "is_active"]
+    rows = fetch_all("""
+        SELECT *
+        FROM network_map
+        ORDER BY CAST(COALESCE(vlan_id, '0') AS INTEGER), hotel_name, ssid_name
+    """)
+
+    edit_row = None
+    if str(edit_id).strip().isdigit():
+        edit_row = fetch_one("SELECT * FROM network_map WHERE id = ?", (int(edit_id),))
 
     msg_html = ""
     if error:
@@ -839,7 +846,7 @@ def admin_networks(request: Request, error: str = "", ok: str = ""):
     if ok:
         msg_html += f'<div style="margin-bottom:12px; padding:12px 14px; border-radius:10px; background:#dcfce7; color:#166534;">{escape(ok)}</div>'
 
-    form = """
+    add_form = """
     <div class="toolbar" style="margin-bottom:16px;">
       <form method="post" action="/admin/networks/add" style="display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:12px; width:100%;">
         <div>
@@ -887,7 +894,115 @@ def admin_networks(request: Request, error: str = "", ok: str = ""):
     </div>
     """
 
-    body = msg_html + form + html_table(rows, cols)
+    edit_form = ""
+    if edit_row:
+        current_active = "1" if int(edit_row.get("is_active") or 0) == 1 else "0"
+        edit_form = f"""
+        <div class="toolbar" style="margin-bottom:16px; padding:16px; border:1px solid #dbe2ea; border-radius:14px; background:#f8fafc;">
+          <div style="font-size:18px; font-weight:700; margin-bottom:12px;">Редактирование сети ID {int(edit_row["id"])}</div>
+          <form method="post" action="/admin/networks/update" style="display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:12px; width:100%;">
+            <input type="hidden" name="network_id" value="{int(edit_row["id"])}">
+
+            <div>
+              <label style="display:block; margin-bottom:6px; font-weight:600;">Объект</label>
+              <input type="text" name="hotel_name" value="{escape(str(edit_row.get("hotel_name") or ""))}" required>
+            </div>
+
+            <div>
+              <label style="display:block; margin-bottom:6px; font-weight:600;">Wi-Fi сеть</label>
+              <input type="text" name="ssid_name" value="{escape(str(edit_row.get("ssid_name") or ""))}" required>
+            </div>
+
+            <div>
+              <label style="display:block; margin-bottom:6px; font-weight:600;">VLAN</label>
+              <input type="text" name="vlan_id" value="{escape(str(edit_row.get("vlan_id") or ""))}">
+            </div>
+
+            <div>
+              <label style="display:block; margin-bottom:6px; font-weight:600;">Подсеть</label>
+              <input type="text" name="subnet_cidr" value="{escape(str(edit_row.get("subnet_cidr") or ""))}" required>
+            </div>
+
+            <div>
+              <label style="display:block; margin-bottom:6px; font-weight:600;">Интерфейс MikroTik</label>
+              <input type="text" name="mikrotik_interface" value="{escape(str(edit_row.get("mikrotik_interface") or ""))}">
+            </div>
+
+            <div>
+              <label style="display:block; margin-bottom:6px; font-weight:600;">Hotspot server</label>
+              <input type="text" name="hotspot_server" value="{escape(str(edit_row.get("hotspot_server") or ""))}">
+            </div>
+
+            <div>
+              <label style="display:block; margin-bottom:6px; font-weight:600;">Активна</label>
+              <select name="is_active" style="height:42px;">
+                <option value="1" {"selected" if current_active == "1" else ""}>Да</option>
+                <option value="0" {"selected" if current_active == "0" else ""}>Нет</option>
+              </select>
+            </div>
+
+            <div style="display:flex; align-items:flex-end; gap:10px;">
+              <button class="btn primary" type="submit">Сохранить</button>
+              <a class="btn" href="/admin/networks">Отмена</a>
+            </div>
+          </form>
+        </div>
+        """
+
+    table_html = """
+    <div style="overflow-x:auto;">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Объект</th>
+            <th>Wi-Fi сеть</th>
+            <th>VLAN</th>
+            <th>Подсеть</th>
+            <th>Интерфейс MikroTik</th>
+            <th>Hotspot server</th>
+            <th>Активна</th>
+            <th>Действия</th>
+          </tr>
+        </thead>
+        <tbody>
+    """
+
+    for row in rows:
+        rid = int(row["id"])
+        is_active = int(row.get("is_active") or 0)
+        active_text = "Да" if is_active == 1 else "Нет"
+        toggle_text = "Выключить" if is_active == 1 else "Включить"
+
+        table_html += f"""
+          <tr>
+            <td>{rid}</td>
+            <td>{escape(str(row.get("hotel_name") or ""))}</td>
+            <td>{escape(str(row.get("ssid_name") or ""))}</td>
+            <td>{escape(str(row.get("vlan_id") or ""))}</td>
+            <td>{escape(str(row.get("subnet_cidr") or ""))}</td>
+            <td>{escape(str(row.get("mikrotik_interface") or ""))}</td>
+            <td>{escape(str(row.get("hotspot_server") or ""))}</td>
+            <td>{active_text}</td>
+            <td>
+              <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                <a class="btn" href="/admin/networks?edit_id={rid}">Редактировать</a>
+                <form method="post" action="/admin/networks/toggle" style="margin:0;">
+                  <input type="hidden" name="network_id" value="{rid}">
+                  <button class="btn" type="submit">{toggle_text}</button>
+                </form>
+              </div>
+            </td>
+          </tr>
+        """
+
+    table_html += """
+        </tbody>
+      </table>
+    </div>
+    """
+
+    body = msg_html + add_form + edit_form + table_html
     return admin_page("Сети", body, active_tab="networks")
 
 
@@ -961,6 +1076,123 @@ def admin_networks_add(
     conn.close()
 
     return RedirectResponse(url="/admin/networks?ok=Сеть добавлена", status_code=303)
+
+
+@app.post("/admin/networks/update")
+def admin_networks_update(
+    request: Request,
+    network_id: str = Form(""),
+    hotel_name: str = Form(""),
+    ssid_name: str = Form(""),
+    vlan_id: str = Form(""),
+    subnet_cidr: str = Form(""),
+    mikrotik_interface: str = Form(""),
+    hotspot_server: str = Form(""),
+    is_active: str = Form("1"),
+):
+    guard = admin_guard(request)
+    if guard:
+        return guard
+
+    if not str(network_id).strip().isdigit():
+        return RedirectResponse(url="/admin/networks?error=Некорректный ID сети", status_code=303)
+
+    network_id_int = int(network_id)
+    hotel_name = hotel_name.strip()
+    ssid_name = ssid_name.strip()
+    vlan_id = vlan_id.strip()
+    subnet_cidr = subnet_cidr.strip()
+    mikrotik_interface = mikrotik_interface.strip()
+    hotspot_server = hotspot_server.strip()
+    is_active_val = 1 if str(is_active).strip() == "1" else 0
+
+    if not hotel_name:
+        return RedirectResponse(url=f"/admin/networks?edit_id={network_id_int}&error=Не заполнено поле 'Объект'", status_code=303)
+
+    if not ssid_name:
+        return RedirectResponse(url=f"/admin/networks?edit_id={network_id_int}&error=Не заполнено поле 'Wi-Fi сеть'", status_code=303)
+
+    if not subnet_cidr:
+        return RedirectResponse(url=f"/admin/networks?edit_id={network_id_int}&error=Не заполнено поле 'Подсеть'", status_code=303)
+
+    if vlan_id and not vlan_id.isdigit():
+        return RedirectResponse(url=f"/admin/networks?edit_id={network_id_int}&error=VLAN должен быть числом", status_code=303)
+
+    try:
+        ipaddress.ip_network(subnet_cidr, strict=False)
+    except ValueError:
+        return RedirectResponse(url=f"/admin/networks?edit_id={network_id_int}&error=Некорректная подсеть CIDR", status_code=303)
+
+    row = fetch_one("SELECT id FROM network_map WHERE id = ?", (network_id_int,))
+    if not row:
+        return RedirectResponse(url="/admin/networks?error=Сеть не найдена", status_code=303)
+
+    dup = fetch_one("""
+        SELECT id
+        FROM network_map
+        WHERE hotel_name = ?
+          AND ssid_name = ?
+          AND subnet_cidr = ?
+          AND id <> ?
+        LIMIT 1
+    """, (hotel_name, ssid_name, subnet_cidr, network_id_int))
+
+    if dup:
+        return RedirectResponse(url=f"/admin/networks?edit_id={network_id_int}&error=Такая сеть уже существует", status_code=303)
+
+    conn = db()
+    conn.execute("""
+        UPDATE network_map
+        SET hotel_name = ?,
+            ssid_name = ?,
+            vlan_id = ?,
+            subnet_cidr = ?,
+            mikrotik_interface = ?,
+            hotspot_server = ?,
+            is_active = ?
+        WHERE id = ?
+    """, (
+        hotel_name,
+        ssid_name,
+        vlan_id or None,
+        subnet_cidr,
+        mikrotik_interface or None,
+        hotspot_server or None,
+        is_active_val,
+        network_id_int,
+    ))
+    conn.commit()
+    conn.close()
+
+    return RedirectResponse(url="/admin/networks?ok=Сеть сохранена", status_code=303)
+
+
+@app.post("/admin/networks/toggle")
+def admin_networks_toggle(
+    request: Request,
+    network_id: str = Form(""),
+):
+    guard = admin_guard(request)
+    if guard:
+        return guard
+
+    if not str(network_id).strip().isdigit():
+        return RedirectResponse(url="/admin/networks?error=Некорректный ID сети", status_code=303)
+
+    network_id_int = int(network_id)
+    row = fetch_one("SELECT id, is_active FROM network_map WHERE id = ?", (network_id_int,))
+    if not row:
+        return RedirectResponse(url="/admin/networks?error=Сеть не найдена", status_code=303)
+
+    new_active = 0 if int(row.get("is_active") or 0) == 1 else 1
+
+    conn = db()
+    conn.execute("UPDATE network_map SET is_active = ? WHERE id = ?", (new_active, network_id_int))
+    conn.commit()
+    conn.close()
+
+    msg = "Сеть включена" if new_active == 1 else "Сеть выключена"
+    return RedirectResponse(url=f"/admin/networks?ok={msg}", status_code=303)
 
 
 @app.get("/admin/find", response_class=HTMLResponse)
