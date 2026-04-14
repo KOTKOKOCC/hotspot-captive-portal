@@ -6,6 +6,7 @@ from html import escape
 from collections import OrderedDict
 import re
 import threading
+import ipaddress
 
 
 from labels import (
@@ -705,7 +706,7 @@ def admin_sessions(
     """)
     causes = [r["terminate_cause"] for r in cause_rows]
 
-    hotel_options = ['<option value="">Все отели</option>']
+    hotel_options = ['<option value="">Все объекты</option>']
     for h in hotels:
         selected = " selected" if h == hotel else ""
         hotel_options.append(f'<option value="{escape(h)}"{selected}>{escape(h)}</option>')
@@ -736,7 +737,7 @@ def admin_sessions(
         </div>
 
         <div>
-          <label style="display:block; margin-bottom:6px; font-weight:600;">Отель</label>
+          <label style="display:block; margin-bottom:6px; font-weight:600;">Объект</label>
           <select name="hotel">
             {''.join(hotel_options)}
           </select>
@@ -824,11 +825,143 @@ def admin_audit():
 
 
 @app.get("/admin/networks", response_class=HTMLResponse)
-def admin_networks():
-    rows = fetch_all("SELECT * FROM network_map ORDER BY vlan_id")
+def admin_networks(request: Request, error: str = "", ok: str = ""):
+    guard = admin_guard(request)
+    if guard:
+        return guard
+
+    rows = fetch_all("SELECT * FROM network_map ORDER BY CAST(COALESCE(vlan_id, '0') AS INTEGER), hotel_name, ssid_name")
     cols = ["id", "hotel_name", "ssid_name", "vlan_id", "subnet_cidr", "mikrotik_interface", "hotspot_server", "is_active"]
-    body = html_table(rows, cols)
+
+    msg_html = ""
+    if error:
+        msg_html += f'<div style="margin-bottom:12px; padding:12px 14px; border-radius:10px; background:#fee2e2; color:#991b1b;">{escape(error)}</div>'
+    if ok:
+        msg_html += f'<div style="margin-bottom:12px; padding:12px 14px; border-radius:10px; background:#dcfce7; color:#166534;">{escape(ok)}</div>'
+
+    form = """
+    <div class="toolbar" style="margin-bottom:16px;">
+      <form method="post" action="/admin/networks/add" style="display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:12px; width:100%;">
+        <div>
+          <label style="display:block; margin-bottom:6px; font-weight:600;">Объект</label>
+          <input type="text" name="hotel_name" placeholder="Например, Корпус А" required>
+        </div>
+
+        <div>
+          <label style="display:block; margin-bottom:6px; font-weight:600;">Wi-Fi сеть</label>
+          <input type="text" name="ssid_name" placeholder="Например, Guest Wi-Fi" required>
+        </div>
+
+        <div>
+          <label style="display:block; margin-bottom:6px; font-weight:600;">VLAN</label>
+          <input type="text" name="vlan_id" placeholder="Например, 120">
+        </div>
+
+        <div>
+          <label style="display:block; margin-bottom:6px; font-weight:600;">Подсеть</label>
+          <input type="text" name="subnet_cidr" placeholder="Например, 10.10.120.0/24" required>
+        </div>
+
+        <div>
+          <label style="display:block; margin-bottom:6px; font-weight:600;">Интерфейс MikroTik</label>
+          <input type="text" name="mikrotik_interface" placeholder="Например, vlan120-guest">
+        </div>
+
+        <div>
+          <label style="display:block; margin-bottom:6px; font-weight:600;">Hotspot server</label>
+          <input type="text" name="hotspot_server" placeholder="Например, hs-guest-120">
+        </div>
+
+        <div>
+          <label style="display:block; margin-bottom:6px; font-weight:600;">Активна</label>
+          <select name="is_active" style="height:42px;">
+            <option value="1" selected>Да</option>
+            <option value="0">Нет</option>
+          </select>
+        </div>
+
+        <div style="display:flex; align-items:flex-end;">
+          <button class="btn primary" type="submit" style="width:100%;">Добавить сеть</button>
+        </div>
+      </form>
+    </div>
+    """
+
+    body = msg_html + form + html_table(rows, cols)
     return admin_page("Сети", body, active_tab="networks")
+
+
+@app.post("/admin/networks/add")
+def admin_networks_add(
+    request: Request,
+    hotel_name: str = Form(""),
+    ssid_name: str = Form(""),
+    vlan_id: str = Form(""),
+    subnet_cidr: str = Form(""),
+    mikrotik_interface: str = Form(""),
+    hotspot_server: str = Form(""),
+    is_active: str = Form("1"),
+):
+    guard = admin_guard(request)
+    if guard:
+        return guard
+
+    hotel_name = hotel_name.strip()
+    ssid_name = ssid_name.strip()
+    vlan_id = vlan_id.strip()
+    subnet_cidr = subnet_cidr.strip()
+    mikrotik_interface = mikrotik_interface.strip()
+    hotspot_server = hotspot_server.strip()
+    is_active_val = 1 if str(is_active).strip() == "1" else 0
+
+    if not hotel_name:
+        return RedirectResponse(url="/admin/networks?error=Не заполнено поле 'Объект'", status_code=303)
+
+    if not ssid_name:
+        return RedirectResponse(url="/admin/networks?error=Не заполнено поле 'Wi-Fi сеть'", status_code=303)
+
+    if not subnet_cidr:
+        return RedirectResponse(url="/admin/networks?error=Не заполнено поле 'Подсеть'", status_code=303)
+
+    if vlan_id and not vlan_id.isdigit():
+        return RedirectResponse(url="/admin/networks?error=VLAN должен быть числом", status_code=303)
+
+    try:
+        ipaddress.ip_network(subnet_cidr, strict=False)
+    except ValueError:
+        return RedirectResponse(url="/admin/networks?error=Некорректная подсеть CIDR", status_code=303)
+
+    dup = fetch_one("""
+        SELECT id
+        FROM network_map
+        WHERE hotel_name = ?
+          AND ssid_name = ?
+          AND subnet_cidr = ?
+        LIMIT 1
+    """, (hotel_name, ssid_name, subnet_cidr))
+
+    if dup:
+        return RedirectResponse(url="/admin/networks?error=Такая сеть уже существует", status_code=303)
+
+    conn = db()
+    conn.execute("""
+        INSERT INTO network_map
+        (hotel_name, ssid_name, vlan_id, subnet_cidr, mikrotik_interface, hotspot_server, is_active)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        hotel_name,
+        ssid_name,
+        vlan_id or None,
+        subnet_cidr,
+        mikrotik_interface or None,
+        hotspot_server or None,
+        is_active_val
+    ))
+    conn.commit()
+    conn.close()
+
+    return RedirectResponse(url="/admin/networks?ok=Сеть добавлена", status_code=303)
+
 
 @app.get("/admin/find", response_class=HTMLResponse)
 def admin_find(request: Request, q: str = ""):
