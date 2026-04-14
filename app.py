@@ -976,7 +976,7 @@ def admin_networks(request: Request, error: str = "", ok: str = "", edit_id: str
         rid = int(row["id"])
         is_active = int(r(row, "is_active", 0))
         active_text = "Да" if is_active == 1 else "Нет"
-        toggle_text = "Выключить" if is_active == 1 else "Включить"
+        toggle_text = "Отключить" if is_active == 1 else "Включить"
 
         table_html += f"""
           <tr>
@@ -989,11 +989,23 @@ def admin_networks(request: Request, error: str = "", ok: str = "", edit_id: str
             <td>{escape(str(r(row, "hotspot_server")))}</td>
             <td>{active_text}</td>
             <td>
-              <div style="display:flex; gap:8px; flex-wrap:wrap;">
-                <a class="btn" href="/admin/networks?edit_id={rid}">Редактировать</a>
+              <div style="display:flex; gap:8px; align-items:center; flex-wrap:nowrap;">
+                <a class="btn" href="/admin/networks?edit_id={rid}" style="display:inline-flex; align-items:center; justify-content:center; min-width:112px; height:40px; padding:0 14px; white-space:nowrap; font-size:16px; font-weight:700;">
+                  Изменить
+                </a>
+
                 <form method="post" action="/admin/networks/toggle" style="margin:0;">
                   <input type="hidden" name="network_id" value="{rid}">
-                  <button class="btn" type="submit">{toggle_text}</button>
+                  <button class="btn" type="submit" style="display:inline-flex; align-items:center; justify-content:center; min-width:112px; height:40px; padding:0 14px; white-space:nowrap; font-size:16px; font-weight:700;">
+                    {toggle_text}
+                  </button>
+                </form>
+
+                <form method="post" action="/admin/networks/delete" style="margin:0;" onsubmit="return confirm('Удалить сеть? Это действие необратимо.');">
+                  <input type="hidden" name="network_id" value="{rid}">
+                  <button class="btn" type="submit" style="display:inline-flex; align-items:center; justify-content:center; min-width:112px; height:40px; padding:0 14px; white-space:nowrap; font-size:16px; font-weight:700;">
+                    Удалить
+                  </button>
                 </form>
               </div>
             </td>
@@ -1197,6 +1209,66 @@ def admin_networks_toggle(
 
     msg = "Сеть включена" if new_active == 1 else "Сеть выключена"
     return RedirectResponse(url=f"/admin/networks?ok={msg}", status_code=303)
+
+
+@app.post("/admin/networks/delete")
+def admin_networks_delete(
+    request: Request,
+    network_id: str = Form(""),
+):
+    guard = admin_guard(request)
+    if guard:
+        return guard
+
+    if not str(network_id).strip().isdigit():
+        return RedirectResponse(url="/admin/networks?error=Некорректный ID сети", status_code=303)
+
+    network_id_int = int(network_id)
+
+    row = fetch_one("""
+        SELECT id, hotel_name, ssid_name, vlan_id
+        FROM network_map
+        WHERE id = ?
+    """, (network_id_int,))
+    if not row:
+        return RedirectResponse(url="/admin/networks?error=Сеть не найдена", status_code=303)
+
+    hotel_name = (row["hotel_name"] or "").strip()
+    ssid_name = (row["ssid_name"] or "").strip()
+    vlan_id = str(row["vlan_id"] or "").strip()
+
+    conn = db()
+
+    session_ref = conn.execute("""
+        SELECT 1
+        FROM guest_sessions
+        WHERE COALESCE(hotel, '') = ?
+          AND COALESCE(ssid, '') = ?
+          AND COALESCE(CAST(vlan_id AS TEXT), '') = ?
+        LIMIT 1
+    """, (hotel_name, ssid_name, vlan_id)).fetchone()
+
+    pending_ref = conn.execute("""
+        SELECT 1
+        FROM pending_auth
+        WHERE COALESCE(hotel, '') = ?
+          AND COALESCE(ssid, '') = ?
+          AND COALESCE(CAST(vlan_id AS TEXT), '') = ?
+        LIMIT 1
+    """, (hotel_name, ssid_name, vlan_id)).fetchone()
+
+    if session_ref or pending_ref:
+        conn.close()
+        return RedirectResponse(
+            url="/admin/networks?error=Нельзя удалить сеть: по ней уже есть связанные данные. Используйте отключение.",
+            status_code=303
+        )
+
+    conn.execute("DELETE FROM network_map WHERE id = ?", (network_id_int,))
+    conn.commit()
+    conn.close()
+
+    return RedirectResponse(url="/admin/networks?ok=Сеть удалена", status_code=303)
 
 
 @app.get("/admin/find", response_class=HTMLResponse)
