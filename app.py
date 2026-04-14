@@ -914,27 +914,27 @@ def admin_networks(request: Request, error: str = "", ok: str = "", edit_id: str
 
             <div>
               <label style="display:block; margin-bottom:6px; font-weight:600;">Wi-Fi сеть</label>
-              <input type="text" name="ssid_name" value="{escape(str(edit_row.get("ssid_name") or ""))}" required>
+              <input type="text" name="ssid_name" value="{escape(str(edit_row['ssid_name'] or ''))}" required>
             </div>
 
             <div>
               <label style="display:block; margin-bottom:6px; font-weight:600;">VLAN</label>
-              <input type="text" name="vlan_id" value="{escape(str(edit_row.get("vlan_id") or ""))}">
+              <input type="text" name="vlan_id" value="{escape(str(edit_row['vlan_id'] or ''))}">
             </div>
 
             <div>
               <label style="display:block; margin-bottom:6px; font-weight:600;">Подсеть</label>
-              <input type="text" name="subnet_cidr" value="{escape(str(edit_row.get("subnet_cidr") or ""))}" required>
+              <input type="text" name="subnet_cidr" value="{escape(str(edit_row['subnet_cidr'] or ''))}" required>
             </div>
 
             <div>
               <label style="display:block; margin-bottom:6px; font-weight:600;">Интерфейс MikroTik</label>
-              <input type="text" name="mikrotik_interface" value="{escape(str(edit_row.get("mikrotik_interface") or ""))}">
+              <input type="text" name="mikrotik_interface" value="{escape(str(edit_row['mikrotik_interface'] or ''))}">
             </div>
 
             <div>
               <label style="display:block; margin-bottom:6px; font-weight:600;">Hotspot server</label>
-              <input type="text" name="hotspot_server" value="{escape(str(edit_row.get("hotspot_server") or ""))}">
+              <input type="text" name="hotspot_server" value="{escape(str(edit_row['hotspot_server'] or ''))}">
             </div>
 
             <div>
@@ -1188,7 +1188,7 @@ def admin_networks_toggle(
     if not row:
         return RedirectResponse(url="/admin/networks?error=Сеть не найдена", status_code=303)
 
-    new_active = 0 if int(row.get("is_active") or 0) == 1 else 1
+    new_active = 0 if int(row["is_active"] or 0) == 1 else 1
 
     conn = db()
     conn.execute("UPDATE network_map SET is_active = ? WHERE id = ?", (new_active, network_id_int))
