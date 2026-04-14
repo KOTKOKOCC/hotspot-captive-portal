@@ -830,6 +830,10 @@ def admin_networks(request: Request, error: str = "", ok: str = "", edit_id: str
     if guard:
         return guard
 
+    def r(row, key, default=""):
+        value = row[key]
+        return default if value is None else value
+
     rows = fetch_all("""
         SELECT *
         FROM network_map
