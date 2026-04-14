@@ -896,7 +896,7 @@ def admin_networks(request: Request, error: str = "", ok: str = "", edit_id: str
 
     edit_form = ""
     if edit_row:
-        current_active = "1" if int(edit_row.get("is_active") or 0) == 1 else "0"
+        current_active = "1" if int(r(edit_row, "is_active", 0)) == 1 else "0"
         edit_form = f"""
         <div class="toolbar" style="margin-bottom:16px; padding:16px; border:1px solid #dbe2ea; border-radius:14px; background:#f8fafc;">
           <div style="font-size:18px; font-weight:700; margin-bottom:12px;">Редактирование сети ID {int(edit_row["id"])}</div>
@@ -905,7 +905,7 @@ def admin_networks(request: Request, error: str = "", ok: str = "", edit_id: str
 
             <div>
               <label style="display:block; margin-bottom:6px; font-weight:600;">Объект</label>
-              <input type="text" name="hotel_name" value="{escape(str(edit_row.get("hotel_name") or ""))}" required>
+              <input type="text" name="hotel_name" value="{escape(str(r(edit_row, 'hotel_name')))}" required>
             </div>
 
             <div>
@@ -970,19 +970,19 @@ def admin_networks(request: Request, error: str = "", ok: str = "", edit_id: str
 
     for row in rows:
         rid = int(row["id"])
-        is_active = int(row.get("is_active") or 0)
+        is_active = int(r(row, "is_active", 0))
         active_text = "Да" if is_active == 1 else "Нет"
         toggle_text = "Выключить" if is_active == 1 else "Включить"
 
         table_html += f"""
           <tr>
             <td>{rid}</td>
-            <td>{escape(str(row.get("hotel_name") or ""))}</td>
-            <td>{escape(str(row.get("ssid_name") or ""))}</td>
-            <td>{escape(str(row.get("vlan_id") or ""))}</td>
-            <td>{escape(str(row.get("subnet_cidr") or ""))}</td>
-            <td>{escape(str(row.get("mikrotik_interface") or ""))}</td>
-            <td>{escape(str(row.get("hotspot_server") or ""))}</td>
+            <td>{escape(str(r(row, "hotel_name")))}</td>
+            <td>{escape(str(r(row, "ssid_name")))}</td>
+            <td>{escape(str(r(row, "vlan_id")))}</td>
+            <td>{escape(str(r(row, "subnet_cidr")))}</td>
+            <td>{escape(str(r(row, "mikrotik_interface")))}</td>
+            <td>{escape(str(r(row, "hotspot_server")))}</td>
             <td>{active_text}</td>
             <td>
               <div style="display:flex; gap:8px; flex-wrap:wrap;">
