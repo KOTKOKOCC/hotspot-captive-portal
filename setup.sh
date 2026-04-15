@@ -20,7 +20,7 @@ prompt_with_default() {
   if [ -z "$value" ]; then
     value="$default"
   fi
-  echo "$value"
+  printf '%s' "$value"
 }
 
 prompt_secret_with_default() {
@@ -28,11 +28,11 @@ prompt_secret_with_default() {
   local default="$2"
   local value
   read -r -s -p "$prompt [$default]: " value
-  echo
+  printf '\n' >&2
   if [ -z "$value" ]; then
     value="$default"
   fi
-  echo "$value"
+  printf '%s' "$value"
 }
 
 echo "[1/4] Preparing virtual environment"
