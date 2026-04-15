@@ -46,8 +46,14 @@ fi
 echo
 echo "[2/4] Installing dependencies"
 source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
+
+if [ ! -x ".venv/bin/python" ]; then
+  echo "Failed to initialize virtual environment."
+  exit 1
+fi
+
+pip install --upgrade pip --default-timeout=100 --retries 10
+pip install -r requirements.txt --default-timeout=100 --retries 10
 
 echo
 echo "[3/4] Configuring application"
@@ -65,29 +71,37 @@ DEVICE_SYNC_INTERVAL_VAL=$(prompt_with_default "MikroTik sync interval (seconds)
 
 MT_HOST_VAL=$(prompt_with_default "MikroTik host" "192.168.88.1")
 MT_PORT_VAL=$(prompt_with_default "MikroTik API port" "8728")
+if ! [[ "$MT_PORT_VAL" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: MikroTik API port must be a number."
+  exit 1
+fi
 MT_USER_VAL=$(prompt_with_default "MikroTik API user" "api-read")
 MT_PASS_VAL=$(prompt_secret_with_default "MikroTik API password" "change_me")
 
+escape_env() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
 rm -f .env
 
-cat > .env <<EOF
-APP_NAME="$APP_NAME_VAL"
-DB_PATH="$DB_PATH_VAL"
+{
+  echo "APP_NAME=\"$(escape_env "$APP_NAME_VAL")\""
+  echo "DB_PATH=\"$(escape_env "$DB_PATH_VAL")\""
 
-APP_SECRET="$APP_SECRET_VAL"
-ADMIN_USERNAME="$ADMIN_USERNAME_VAL"
-ADMIN_PASSWORD="$ADMIN_PASSWORD_VAL"
-ADMIN_COOKIE="$ADMIN_COOKIE_VAL"
+  echo "APP_SECRET=\"$(escape_env "$APP_SECRET_VAL")\""
+  echo "ADMIN_USERNAME=\"$(escape_env "$ADMIN_USERNAME_VAL")\""
+  echo "ADMIN_PASSWORD=\"$(escape_env "$ADMIN_PASSWORD_VAL")\""
+  echo "ADMIN_COOKIE=\"$(escape_env "$ADMIN_COOKIE_VAL")\""
 
-DEVICE_LIMIT="$DEVICE_LIMIT_VAL"
-PENDING_MINUTES="$PENDING_MINUTES_VAL"
-DEVICE_SYNC_INTERVAL="$DEVICE_SYNC_INTERVAL_VAL"
+  echo "DEVICE_LIMIT=\"$(escape_env "$DEVICE_LIMIT_VAL")\""
+  echo "PENDING_MINUTES=\"$(escape_env "$PENDING_MINUTES_VAL")\""
+  echo "DEVICE_SYNC_INTERVAL=\"$(escape_env "$DEVICE_SYNC_INTERVAL_VAL")\""
 
-MT_HOST="$MT_HOST_VAL"
-MT_PORT="$MT_PORT_VAL"
-MT_USER="$MT_USER_VAL"
-MT_PASS="$MT_PASS_VAL"
-EOF
+  echo "MT_HOST=\"$(escape_env "$MT_HOST_VAL")\""
+  echo "MT_PORT=\"$(escape_env "$MT_PORT_VAL")\""
+  echo "MT_USER=\"$(escape_env "$MT_USER_VAL")\""
+  echo "MT_PASS=\"$(escape_env "$MT_PASS_VAL")\""
+} > .env
 
 mkdir -p backups docs deploy
 
