@@ -124,6 +124,11 @@ def html_table(rows, columns):
                 cells.append(f'<td><a href="{phone_link}">{escape(str(value))}</a></td>')
                 continue
 
+            elif col == "mac" and value:
+                mac_link = f'/admin/client?mac={quote_plus(str(value))}'
+                cells.append(f'<td><a href="{mac_link}">{escape(str(value))}</a></td>')
+                continue
+                
             cells.append(f"<td>{escape(str(value))}</td>")
 
         parts.append("<tr>" + "".join(cells) + "</tr>")

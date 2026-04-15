@@ -7,6 +7,7 @@ from collections import OrderedDict
 import re
 import threading
 import ipaddress
+from urllib.parse import quote
 
 
 from labels import (
@@ -606,6 +607,7 @@ def admin_index(request: Request):
     """
     return admin_page("Панель управления", body, active_tab="home")
 
+
 @app.get("/admin/guests", response_class=HTMLResponse)
 def admin_guests():
     rows = fetch_all("SELECT * FROM guests ORDER BY created_at DESC LIMIT 300")
@@ -613,12 +615,15 @@ def admin_guests():
     body = html_table(rows, cols)
     return admin_page("Гости", body, active_tab="guests")
 
+
 @app.get("/admin/sessions", response_class=HTMLResponse)
 def admin_sessions(
     request: Request,
     q: str = "",
     status: str = "all",
     hotel: str = "",
+    ssid: str = "",
+    vlan_id: str = "",
     terminate_cause: str = "",
     date_from: str = "",
     date_to: str = "",
@@ -664,6 +669,14 @@ def admin_sessions(
         where.append("hotel = ?")
         params.append(hotel.strip())
 
+    if ssid.strip():
+        where.append("ssid = ?")
+        params.append(ssid.strip())
+
+    if vlan_id.strip():
+        where.append("vlan_id = ?")
+        params.append(vlan_id.strip())
+
     if terminate_cause.strip():
         where.append("terminate_cause = ?")
         params.append(terminate_cause.strip())
@@ -690,6 +703,23 @@ def admin_sessions(
         tuple(params)
     )
 
+
+    linked_rows = []
+    for row in rows:
+        row_dict = dict(row)
+        if row["phone"]:
+            row_dict["phone"] = (
+                f'<a href="/admin/client?phone={quote(str(row["phone"]))}" '
+                f'style="text-decoration:none;">{escape(str(row["phone"]))}</a>'
+            )
+        if row["mac"]:
+            row_dict["mac"] = (
+                f'<a href="/admin/client?mac={quote(str(row["mac"]))}" '
+                f'style="text-decoration:none;">{escape(str(row["mac"]))}</a>'
+            )
+        linked_rows.append(row_dict)
+
+
     hotel_rows = fetch_all("""
         SELECT DISTINCT hotel
         FROM guest_sessions
@@ -697,6 +727,24 @@ def admin_sessions(
         ORDER BY hotel
     """)
     hotels = [r["hotel"] for r in hotel_rows]
+
+    ssid_rows = fetch_all("""
+        SELECT DISTINCT ssid
+        FROM guest_sessions
+        WHERE ssid IS NOT NULL AND ssid != ''
+        ORDER BY ssid
+    """)
+    ssids = [r["ssid"] for r in ssid_rows]
+
+    vlan_rows = fetch_all("""
+        SELECT DISTINCT vlan_id
+        FROM guest_sessions
+        WHERE vlan_id IS NOT NULL
+          AND TRIM(CAST(vlan_id AS TEXT)) != ''
+          AND CAST(vlan_id AS TEXT) GLOB '[0-9]*'
+        ORDER BY CAST(vlan_id AS INTEGER), CAST(vlan_id AS TEXT)
+    """)
+    vlans = [str(r["vlan_id"]) for r in vlan_rows]
 
     cause_rows = fetch_all("""
         SELECT DISTINCT terminate_cause
@@ -710,6 +758,16 @@ def admin_sessions(
     for h in hotels:
         selected = " selected" if h == hotel else ""
         hotel_options.append(f'<option value="{escape(h)}"{selected}>{escape(h)}</option>')
+
+    ssid_options = ['<option value="">Все Wi-Fi сети</option>']
+    for s in ssids:
+        selected = " selected" if s == ssid else ""
+        ssid_options.append(f'<option value="{escape(s)}"{selected}>{escape(s)}</option>')
+
+    vlan_options = ['<option value="">Все VLAN</option>']
+    for v in vlans:
+        selected = " selected" if v == vlan_id else ""
+        vlan_options.append(f'<option value="{escape(v)}"{selected}>{escape(v)}</option>')
 
     cause_options = ['<option value="">Все причины</option>']
     for c in causes:
@@ -740,6 +798,20 @@ def admin_sessions(
           <label style="display:block; margin-bottom:6px; font-weight:600;">Объект</label>
           <select name="hotel">
             {''.join(hotel_options)}
+          </select>
+        </div>
+
+        <div>
+          <label style="display:block; margin-bottom:6px; font-weight:600;">Wi-Fi сеть</label>
+          <select name="ssid">
+            {''.join(ssid_options)}
+          </select>
+        </div>
+
+        <div>
+          <label style="display:block; margin-bottom:6px; font-weight:600;">VLAN</label>
+          <select name="vlan_id">
+            {''.join(vlan_options)}
           </select>
         </div>
 
@@ -798,7 +870,6 @@ def admin_sessions(
     )
 
     return admin_page("Сессии", body, active_tab="sessions")
-
 
 @app.get("/admin/pending", response_class=HTMLResponse)
 def admin_pending():
@@ -1719,180 +1790,159 @@ def admin_dashboard_data(request: Request, period: str = "1d"):
 
 
 @app.get("/admin/client", response_class=HTMLResponse)
-def admin_client(request: Request, phone: str = ""):
+def admin_client(
+    request: Request,
+    phone: str = "",
+    mac: str = "",
+):
     guard = admin_guard(request)
     if guard:
         return guard
 
-    if not phone.strip():
-        return RedirectResponse(url="/admin/find", status_code=302)
+    phone = phone.strip()
+    mac = mac.strip().lower()
 
-    try:
-        normalized_phone = normalize_phone(phone)
-    except ValueError:
-        body = f"""
-        <div class="toolbar">
-          <form method="get" action="/admin/client" style="display:flex; gap:10px; flex-wrap:wrap;">
-            <input type="text" name="phone" value="{escape(phone)}" placeholder="Введите номер телефона">
-            <button class="btn primary" type="submit">Открыть карточку</button>
-          </form>
-        </div>
-        <div class="muted">Неверный формат номера.</div>
-        """
-        return admin_page("Карточка клиента", body, active_tab="find")
+    normalized_phone = None
 
-    guest = fetch_one("""
-        SELECT *
-        FROM guests
-        WHERE phone = ?
-        LIMIT 1
-    """, (normalized_phone,))
+    if phone:
+        try:
+            normalized_phone = normalize_phone(phone)
+        except Exception:
+            normalized_phone = phone
 
-    sessions = fetch_all("""
-        SELECT *
-        FROM guest_sessions
-        WHERE phone = ?
-        ORDER BY CASE WHEN status='active' THEN 0 ELSE 1 END, started_at DESC
-        LIMIT 10
-    """, (normalized_phone,))
+    if not phone and not mac:
+        return admin_page(
+            "Карточка клиента",
+            '<div class="muted">Не указан номер телефона или MAC-адрес.</div>',
+            active_tab="sessions"
+        )
 
-    calls = fetch_all("""
-        SELECT *
-        FROM call_events
-        WHERE phone = ?
-        ORDER BY created_at DESC
-        LIMIT 10
-    """, (normalized_phone,))
+    where = []
+    params = []
 
-    audit_rows = fetch_all("""
-        SELECT *
-        FROM audit_log
-        WHERE phone = ?
-        ORDER BY event_time DESC
-        LIMIT 20
-    """, (normalized_phone,))
+    if normalized_phone:
+        where.append("phone = ?")
+        params.append(normalized_phone)
 
-    stats = fetch_one("""
-        SELECT
-            COUNT(*) AS total_sessions,
-            SUM(CASE WHEN status='active' AND ended_at IS NULL THEN 1 ELSE 0 END) AS active_sessions,
-            MAX(started_at) AS last_session_start,
-            MAX(last_seen_at) AS last_seen_at,
-            MAX(ended_at) AS last_ended_at
-        FROM guest_sessions
-        WHERE phone = ?
-    """, (normalized_phone,))
+    if mac:
+        where.append("LOWER(mac) = ?")
+        params.append(mac)
 
-    last_closed = fetch_one("""
+    where_sql = " OR ".join(where)
+
+    sessions = fetch_all(
+        f"""
         SELECT *
         FROM guest_sessions
-        WHERE phone = ?
-          AND status = 'closed'
-        ORDER BY ended_at DESC
-        LIMIT 1
-    """, (normalized_phone,))
+        WHERE {where_sql}
+        ORDER BY started_at DESC
+        LIMIT 500
+        """,
+        tuple(params)
+    )
 
-    active_now = "Нет"
-    if stats and stats["active_sessions"] and int(stats["active_sessions"]) > 0:
-        active_now = "Да"
+    if not sessions:
+        return admin_page(
+            "Карточка клиента",
+            '<div class="muted">Сессии по указанным данным не найдены.</div>',
+            active_tab="sessions"
+        )
 
-    summary_cards = f"""
-    <div class="toolbar">
-      <form method="get" action="/admin/client" style="display:flex; gap:10px; flex-wrap:wrap;">
-        <input type="text" name="phone" value="{escape(normalized_phone)}" placeholder="Введите номер телефона">
-        <button class="btn primary" type="submit">Обновить</button>
-      </form>
+    first = sessions[0]
+    client_phone = phone or (first["phone"] or "")
+    client_mac = mac or (first["mac"] or "")
+
+    unique_macs = sorted({(row["mac"] or "").strip() for row in sessions if (row["mac"] or "").strip()})
+    unique_hotels = sorted({(row["hotel"] or "").strip() for row in sessions if (row["hotel"] or "").strip()})
+    unique_ssids = sorted({(row["ssid"] or "").strip() for row in sessions if (row["ssid"] or "").strip()})
+    unique_ips = sorted({(row["ip"] or "").strip() for row in sessions if (row["ip"] or "").strip()})
+    active_count = sum(1 for row in sessions if (row["status"] or "") == "active")
+
+    total_session_time = 0
+    for row in sessions:
+        try:
+            total_session_time += int(row["acct_session_time"] or 0)
+        except Exception:
+            pass
+
+    def fmt_duration(seconds: int) -> str:
+        seconds = max(0, int(seconds))
+        days, rem = divmod(seconds, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes, secs = divmod(rem, 60)
+        if days:
+            return f"{days}д {hours}ч {minutes}м"
+        if hours:
+            return f"{hours}ч {minutes}м"
+        if minutes:
+            return f"{minutes}м {secs}с"
+        return f"{secs}с"
+
+    summary_html = f"""
+    <div class="toolbar" style="margin-bottom:16px; display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:12px;">
+      <div class="card" style="padding:14px;">
+        <div class="muted">Телефон</div>
+        <div style="font-size:18px; font-weight:700;">{escape(client_phone or '—')}</div>
+      </div>
+      <div class="card" style="padding:14px;">
+        <div class="muted">Активных сессий</div>
+        <div style="font-size:18px; font-weight:700;">{active_count}</div>
+      </div>
+      <div class="card" style="padding:14px;">
+        <div class="muted">Всего сессий</div>
+        <div style="font-size:18px; font-weight:700;">{len(sessions)}</div>
+      </div>
+      <div class="card" style="padding:14px;">
+        <div class="muted">Суммарное время</div>
+        <div style="font-size:18px; font-weight:700;">{fmt_duration(total_session_time)}</div>
+      </div>
     </div>
 
-    <div class="stats">
-      <div class="stat">
-        <div class="stat-label">Номер</div>
-        <div class="stat-value" style="font-size:20px;">{escape(normalized_phone)}</div>
+    <div class="toolbar" style="margin-bottom:16px; display:grid; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); gap:12px;">
+      <div class="card" style="padding:14px;">
+        <div class="muted" style="margin-bottom:6px;">MAC-адреса</div>
+        <div>{'<br>'.join(escape(x) for x in unique_macs) if unique_macs else '—'}</div>
       </div>
-      <div class="stat">
-        <div class="stat-label">ID гостя</div>
-        <div class="stat-value">{guest['id'] if guest else '—'}</div>
+      <div class="card" style="padding:14px;">
+        <div class="muted" style="margin-bottom:6px;">Объекты</div>
+        <div>{'<br>'.join(escape(x) for x in unique_hotels) if unique_hotels else '—'}</div>
       </div>
-      <div class="stat">
-        <div class="stat-label">Активен сейчас</div>
-        <div class="stat-value">{active_now}</div>
+      <div class="card" style="padding:14px;">
+        <div class="muted" style="margin-bottom:6px;">Wi-Fi сети</div>
+        <div>{'<br>'.join(escape(x) for x in unique_ssids) if unique_ssids else '—'}</div>
       </div>
-      <div class="stat">
-        <div class="stat-label">Всего сессий</div>
-        <div class="stat-value">{stats['total_sessions'] if stats and stats['total_sessions'] is not None else 0}</div>
-      </div>
-    </div>
-
-    <div class="stats">
-      <div class="stat">
-        <div class="stat-label">Первая верификация</div>
-        <div class="stat-value" style="font-size:18px;">{format_dt(guest['first_verified_at']) if guest and guest['first_verified_at'] else '—'}</div>
-      </div>
-      <div class="stat">
-        <div class="stat-label">Последний допуск</div>
-        <div class="stat-value" style="font-size:18px;">{format_dt(guest['last_auth_at']) if guest and guest['last_auth_at'] else '—'}</div>
-      </div>
-      <div class="stat">
-        <div class="stat-label">Последняя активность</div>
-        <div class="stat-value" style="font-size:18px;">{format_dt(stats['last_seen_at']) if stats and stats['last_seen_at'] else '—'}</div>
-      </div>
-      <div class="stat">
-        <div class="stat-label">Последняя завершённая сессия</div>
-        <div class="stat-value" style="font-size:18px;">{format_dt(last_closed['ended_at']) if last_closed and last_closed['ended_at'] else '—'}</div>
+      <div class="card" style="padding:14px;">
+        <div class="muted" style="margin-bottom:6px;">IP-адреса</div>
+        <div>{'<br>'.join(escape(x) for x in unique_ips) if unique_ips else '—'}</div>
       </div>
     </div>
     """
 
-    body = summary_cards
+    
 
-    body += "<h2 style='margin:24px 0 12px; font-size:22px;'>Гость</h2>"
-    if guest:
-        body += html_table([guest], ["id", "phone", "first_verified_at", "first_hotel", "auth_method", "status", "created_at", "updated_at", "last_auth_at"])
-    else:
-        body += "<div class='muted' style='margin-bottom:16px;'>Запись гостя не найдена.</div>"
+    body = summary_html
+    body += html_table(
+        sessions,
+        [
+            "guest_id",
+            "phone",
+            "mac",
+            "ip",
+            "device_name",
+            "started_at",
+            "last_seen_at",
+            "ended_at",
+            "status",
+            "terminate_cause",
+            "acct_session_time",
+            "hotel",
+            "ssid",
+            "vlan_id",
+            "nas_id",
+            "acct_session_id",
+        ]
+    )
 
-    body += "<h2 style='margin:24px 0 12px; font-size:22px;'>Последние сессии</h2>"
-    if sessions:
-        body += html_table(
-            sessions,
-            [
-                "guest_id",
-                "phone",
-                "mac",
-                "ip",
-                "device_name",
-                "started_at",
-                "last_seen_at",
-                "ended_at",
-                "status",
-                "terminate_cause",
-                "acct_session_time",
-                "hotel",
-                "ssid",
-                "vlan_id",
-                "nas_id",
-                "acct_session_id",
-            ]
-        )
-    else:
-        body += "<div class='muted' style='margin-bottom:16px;'>Сессий не найдено.</div>"
-
-    body += "<h2 style='margin:24px 0 12px; font-size:22px;'>Последние звонки</h2>"
-    if calls:
-        body += html_table(calls, ["id", "phone", "callerid_raw", "source_ip", "created_at", "result"])
-    else:
-        body += "<div class='muted' style='margin-bottom:16px;'>Звонков не найдено.</div>"
-
-    body += "<h2 style='margin:24px 0 12px; font-size:22px;'>Последние события аудита</h2>"
-    if audit_rows:
-        body += html_table(audit_rows, ["id", "phone", "mac", "ip", "nas_id", "hotel", "ssid", "vlan_id", "event_type", "event_time", "details"])
-    else:
-        body += "<div class='muted'>Событий не найдено.</div>"
-
-    return admin_page("Карточка клиента", body, active_tab="find")
-
-
-
-
+    return admin_page("Карточка клиента", body, active_tab="sessions")
 
 
