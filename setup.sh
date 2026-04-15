@@ -12,6 +12,11 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! command -v curl >/dev/null 2>&1; then
+  echo "curl not found. Install curl first."
+  exit 1
+fi
+
 prompt_with_default() {
   local prompt="$1"
   local default="$2"
@@ -33,6 +38,24 @@ prompt_secret_with_default() {
     value="$default"
   fi
   printf '%s' "$value"
+}
+
+install_cleanup_cron() {
+  local app_port="$1"
+  local app_secret="$2"
+
+  local cron_line="*/10 * * * * curl -fsS -X POST http://127.0.0.1:${app_port}/internal/run-cleanup -H \"X-Internal-Token: ${app_secret}\" >> /var/log/hotspot-cleanup.log 2>&1"
+
+  local current_cron
+  current_cron="$(crontab -l 2>/dev/null || true)"
+  current_cron="$(printf '%s\n' "$current_cron" | grep -v '/internal/run-cleanup' || true)"
+
+  {
+    printf '%s\n' "$current_cron"
+    printf '%s\n' "$cron_line"
+  } | crontab -
+
+  echo "Cleanup cron job installed."
 }
 
 echo "[1/4] Preparing virtual environment"
@@ -71,12 +94,22 @@ DEVICE_SYNC_INTERVAL_VAL=$(prompt_with_default "MikroTik sync interval (seconds)
 
 MT_HOST_VAL=$(prompt_with_default "MikroTik host" "192.168.88.1")
 MT_PORT_VAL=$(prompt_with_default "MikroTik API port" "8728")
+
 if ! [[ "$MT_PORT_VAL" =~ ^[0-9]+$ ]]; then
   echo "ERROR: MikroTik API port must be a number."
   exit 1
 fi
+
 MT_USER_VAL=$(prompt_with_default "MikroTik API user" "api-read")
 MT_PASS_VAL=$(prompt_secret_with_default "MikroTik API password" "change_me")
+
+APP_PORT_VAL=$(prompt_with_default "Application port" "8000")
+if ! [[ "$APP_PORT_VAL" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: Application port must be a number."
+  exit 1
+fi
+
+INSTALL_CLEANUP_CRON_VAL=$(prompt_with_default "Install cleanup cron job" "yes")
 
 escape_env() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
@@ -101,7 +134,12 @@ rm -f .env
   echo "MT_PORT=\"$(escape_env "$MT_PORT_VAL")\""
   echo "MT_USER=\"$(escape_env "$MT_USER_VAL")\""
   echo "MT_PASS=\"$(escape_env "$MT_PASS_VAL")\""
+  echo "APP_PORT=\"$(escape_env "$APP_PORT_VAL")\""
 } > .env
+
+if [[ "$INSTALL_CLEANUP_CRON_VAL" == "yes" || "$INSTALL_CLEANUP_CRON_VAL" == "y" || "$INSTALL_CLEANUP_CRON_VAL" == "да" ]]; then
+  install_cleanup_cron "$APP_PORT_VAL" "$APP_SECRET_VAL"
+fi
 
 mkdir -p backups docs deploy
 
@@ -114,10 +152,10 @@ read -r -p "Start backend now? [y/N]: " START_NOW
 START_NOW="$(printf '%s' "$START_NOW" | tr '[:upper:]' '[:lower:]')"
 
 if [[ "$START_NOW" == "y" || "$START_NOW" == "yes" || "$START_NOW" == "да" ]]; then
-  exec python -m uvicorn app:app --host 0.0.0.0 --port 8000
+  exec python -m uvicorn app:app --host 0.0.0.0 --port "$APP_PORT_VAL"
 fi
 
 echo "Done."
 echo "To start later:"
 echo "  source .venv/bin/activate"
-echo "  python -m uvicorn app:app --host 0.0.0.0 --port 8000"
+echo "  python -m uvicorn app:app --host 0.0.0.0 --port $APP_PORT_VAL"

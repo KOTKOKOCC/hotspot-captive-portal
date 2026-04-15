@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Query, Request, Form
+from fastapi import FastAPI, HTTPException, Query, Request, Form, Header
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 from datetime import datetime, timedelta, timezone
@@ -8,6 +8,7 @@ import re
 import threading
 import ipaddress
 from urllib.parse import quote
+from typing import Optional
 
 
 from labels import (
@@ -1946,3 +1947,8 @@ def admin_client(
     return admin_page("Карточка клиента", body, active_tab="sessions")
 
 
+@app.post("/internal/run-cleanup")
+def internal_run_cleanup(x_internal_token: Optional[str] = Header(default=None)):
+    if x_internal_token != APP_SECRET:
+        raise HTTPException(status_code=403, detail="forbidden")
+    return run_cleanup()
