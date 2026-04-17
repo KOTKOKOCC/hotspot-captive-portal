@@ -1,0 +1,6 @@
+exec hotspot_accounting_forward {
+    wait = yes
+    input_pairs = request
+    shell_escape = yes
+    program = "/opt/hotspot-captive-portal/scripts/radius_accounting_forward.py '%{%{Acct-Status-Type}:-}' '%{%{Acct-Session-Id}:-}' '%{%{User-Name}:-}' '%{%{Calling-Station-Id}:-}' '%{%{Framed-IP-Address}:-}' '%{%{NAS-IP-Address}:-}' '%{%{NAS-Identifier}:-}' '%{%{NAS-Port-Id}:-}' '%{%{Called-Station-Id}:-}' '%{%{Acct-Terminate-Cause}:-}' '%{%{Acct-Session-Time}:-0}' '%{%{Event-Timestamp}:-}'"
+}
