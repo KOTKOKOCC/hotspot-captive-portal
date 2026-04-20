@@ -1,0 +1,19 @@
+[Unit]
+Description=Hotspot Auth Portal
+After=network.target
+Wants=network.target
+
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/hotspot-captive-portal
+ExecStart=/opt/hotspot-captive-portal/.venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

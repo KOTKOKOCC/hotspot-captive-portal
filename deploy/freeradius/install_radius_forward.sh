@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -e
 
-PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+PROJECT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 INSTALL_DIR="/opt/hotspot-captive-portal"
 SCRIPTS_DIR="$INSTALL_DIR/scripts"
 
