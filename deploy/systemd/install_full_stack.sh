@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+PROJECT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 UNIT_SRC="$PROJECT_DIR/deploy/systemd/hotspot-captive-portal.service"
 UNIT_DST="/etc/systemd/system/hotspot-captive-portal.service"
 
