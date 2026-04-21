@@ -12,57 +12,84 @@ Backend и админ-панель для гостевого Wi-Fi:
 
 Backend для captive portal с интеграцией FreeRADIUS и MikroTik Hotspot.
 
+
+## Архитектура
+
 Система состоит из двух частей:
 
-1. backend на FastAPI
+1. **backend на FastAPI**
+   - админка
+   - логика авторизации
+   - обработка PBX callback
+   - учет сессий
+   - выгрузки и поиск
+
 2. FreeRADIUS, который:
    - отправляет запросы авторизации в backend через `/radius-check`
    - отправляет accounting-события в backend через `/radius-accounting`
 
+MikroTik Hotspot использует этот сервер как RADIUS.
+
+## Текущее состояние
+
+Проект **не является full-auto installer в одну команду**.
+
+Что есть сейчас:
+
+- `setup.sh` подготавливает Python backend:
+- создает virtualenv
+- ставит зависимости
+- создает `.env`
+- backend можно запустить вручную или через systemd
+- **FreeRADIUS настраивается отдельно вручную**
+- **systemd для backend настраивается отдельно вручную**
+
+То есть `setup.sh` ставит только backend-часть, но не завершает полный production deployment.
+
+## Требования
+
+- Ubuntu 22.04+  
+- Python 3.10+  
+- root-доступ  
+- установленный MikroTik Hotspot  
+- сетевой доступ между MikroTik и сервером  
+- FreeRADIUS 3.x  
 ---
 
-# Текущее состояние
+## Быстрый старт backend
 
-Сейчас проект требует ручной настройки FreeRADIUS и systemd.  
-Полная автоматическая установка в одну команду пока не завершена.
-
-Рабочая схема:
-
-- backend слушает `127.0.0.1:8000`
-- FreeRADIUS использует `rest` для `/radius-check`
-- FreeRADIUS использует `hotspot_accounting_forward` для `/radius-accounting`
-- MikroTik использует этот сервер как RADIUS для Hotspot
-
----
-
-# Требования
-
-- Ubuntu 22.04
-- root-доступ
-- MikroTik Hotspot
-- сетевой доступ между MikroTik и сервером
-
----
-
-# 1. Установка системных пакетов
+### 1. Установка системных пакетов
 
 ```bash
 apt update
 apt install -y git python3 python3-venv sqlite3 curl freeradius freeradius-utils freeradius-rest
 ```
 
----
+### 2. Клонирование и установка репозитория
 
-# 2. Клонирование и установка репозитория
-
-```git clone https://github.com/KOTKOKOCC/hotspot-captive-portal.git
+```
+git clone https://github.com/KOTKOKOCC/hotspot-captive-portal.git
 cd hotspot-captive-portal
+```
+
+### 3. Первичная настройка backend
+```
 bash setup.sh
 ```
 
-# 3. Проверка ручного запуска backend
+Скрипт:
 
-```cd /opt/hotspot-captive-portal
+* создаст .venv
+* установит зависимости
+* создаст .env
+* предложит сразу запустить backend
+
+
+
+### 4. Ручной запуск backend для проверки
+
+```
+cd /opt/hotspot-captive-portal
 source .venv/bin/activate
 python -m uvicorn app:app --host 0.0.0.0 --port 8000
 ```
@@ -71,7 +98,7 @@ python -m uvicorn app:app --host 0.0.0.0 --port 8000
 curl http://127.0.0.1:8000/admin/login
 ```
 
-# 4. Настройка systemd для backend
+# Настройка systemd для backend
 
 Создать unit:
 
@@ -106,17 +133,18 @@ WantedBy=multi-user.target
 systemctl daemon-reload
 systemctl enable hotspot-captive-portal
 systemctl start hotspot-captive-portal
+systemctl status hotspot-captive-portal
 ```
 
-# 5. Настройка FreeRADIUS rest
+# Настройка FreeRADIUS
 
 
-1. Включить модуль:
+### 1. Включить модуль rest:
 ```
 ln -s /etc/freeradius/3.0/mods-available/rest /etc/freeradius/3.0/mods-enabled/rest
 ```
 
-2. Настроить:
+### 2. Настроить mods-enable/rest:
    Открыть:
    ```
     nano /etc/freeradius/3.0/mods-enabled/rest
@@ -135,13 +163,11 @@ ln -s /etc/freeradius/3.0/mods-available/rest /etc/freeradius/3.0/mods-enabled/r
     }
    ```
 
-3. Открыть:
-   
-
+### 3. Подключить rest в site-enable/default
+Открыть:
 ```
   nano /etc/freeradius/3.0/sites-enabled/default
 ```
-
 и в блоке authorize{} закоментировать `files` и довабить `rest`
 
 
@@ -160,13 +186,14 @@ ln -s /etc/freeradius/3.0/mods-available/rest /etc/freeradius/3.0/mods-enabled/r
     pap
 ```
 
-# 6. Насктройка accaunting forward
+# Насктройка accaunting forward
 
 В репозитории есть модуль hotspot_accounting_forward и форвардер radius_accounting_forward.py.
 
 Установка:
 
-```bash deploy/freeradius/install_radius_forward.sh
+```
+bash deploy/freeradius/install_radius_forward.sh
 ```
 
 после этого в `/etc/freeradius/3.0/sites-enabled/default` в `accounting {}` должа появится строка `hotspot_accounting_forward`
@@ -184,16 +211,13 @@ accounting {
 }
 ```
 
-# 7. Добавление Mikrotik в FreeRADIUS
+# Добавление Mikrotik в FreeRADIUS
 
 Открыть:
-
 ```
 nano /etc/freeradius/3.0/clients.conf
 ```
-
 Добавить клиента:
-
 ```
 client mikrotik-hotspot {
     ipaddr = 192.168.88.1
@@ -203,10 +227,9 @@ client mikrotik-hotspot {
     require_message_authenticator = yes
 }
 ```
-
 Где `ipaddr` и `secret` - берем из mikrotik.
 
-# 8. Запуск FreeRADIUS
+# Запуск FreeRADIUS
 
 Обычный режим:
 
