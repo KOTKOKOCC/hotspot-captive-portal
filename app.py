@@ -234,6 +234,11 @@ def startup():
     except Exception as e:
         print(f"[mikrotik-sync] worker start skipped: {e}")
 
+    try:
+        start_cleanup_worker()
+    except Exception as e:
+        print(f"[cleanup] worker start skipped: {e}")
+
 
 @app.post("/pbx-call")
 def pbx_call(payload: CallIn):
