@@ -71,6 +71,19 @@ def html_table(rows, columns):
     def fmt_status(value):
         raw = str(value or "")
         val = raw.lower()
+        if val == "pending" and row is not None:
+            expires_at = row["expires_at"] if "expires_at" in row.keys() else None
+            if expires_at:
+                try:
+                    exp = datetime.fromisoformat(str(expires_at))
+                    if exp.tzinfo is None:
+                        exp = exp.replace(tzinfo=timezone.utc)
+                    if datetime.now(timezone.utc) > exp:
+                        val = "expired"
+                        raw = "expired"
+                except Exception:
+                    pass
+        
         label = STATUS_LABELS.get(val, raw)
 
         cls = ""
