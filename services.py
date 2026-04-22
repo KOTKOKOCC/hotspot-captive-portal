@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 import ipaddress
+import threading
+import time
 import json
 
 from db import db
@@ -293,6 +295,34 @@ def save_radius_accounting(evt):
 
     conn.commit()
     conn.close()
+
+
+_cleanup_worker_started = False
+_cleanup_worker_lock = threading.Lock()
+
+
+def _cleanup_worker_loop(interval_seconds: int = 60):
+    while True:
+        try:
+            run_cleanup()
+        except Exception as e:
+            print(f"[cleanup] worker iteration failed: {e}")
+        time.sleep(interval_seconds)
+
+
+def start_cleanup_worker(interval_seconds: int = 60):
+    global _cleanup_worker_started
+    with _cleanup_worker_lock:
+        if _cleanup_worker_started:
+            return
+        thread = threading.Thread(
+            target=_cleanup_worker_loop,
+            args=(interval_seconds,),
+            daemon=True,
+            name="cleanup-worker",
+        )
+        thread.start()
+        _cleanup_worker_started = True
 
 
 def cleanup_db():
