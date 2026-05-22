@@ -75,15 +75,29 @@ def check_routes() -> None:
 
 def check_secrets(strict: bool) -> None:
     import config
+    import os
+    from cryptography.fernet import Fernet
 
     defaults = []
     if config.APP_SECRET == "change_me":
         defaults.append("APP_SECRET")
     if config.ADMIN_PASSWORD == "change_me":
         defaults.append("ADMIN_PASSWORD")
+    voucher_key = os.getenv("VOUCHER_SECRET_KEY", "").strip()
+    if not voucher_key or voucher_key in ("change_me", "generated_by_setup"):
+        defaults.append("VOUCHER_SECRET_KEY")
+
+    invalid = []
+    if voucher_key and voucher_key not in ("change_me", "generated_by_setup"):
+        try:
+            Fernet(voucher_key.encode("utf-8"))
+        except Exception:
+            invalid.append("VOUCHER_SECRET_KEY")
 
     if defaults and strict:
         fail("default secrets are not allowed in strict mode: " + ", ".join(defaults))
+    if invalid:
+        fail("invalid secret format: " + ", ".join(invalid))
     if defaults:
         warn("default local secrets detected: " + ", ".join(defaults))
     else:
