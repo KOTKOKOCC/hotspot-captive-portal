@@ -77,6 +77,89 @@ print_next_steps() {
   echo "  journalctl -u hotspot-captive-portal.service -f"
 }
 
+read_env_value() {
+  local key="$1"
+  local default="$2"
+  local value
+
+  if [ ! -f ".env" ]; then
+    printf '%s' "$default"
+    return
+  fi
+
+  value=$(grep -E "^${key}=" .env | tail -n 1 | cut -d= -f2- || true)
+  value="${value%\"}"
+  value="${value#\"}"
+  value="${value%\'}"
+  value="${value#\'}"
+
+  if [ -z "$value" ]; then
+    value="$default"
+  fi
+
+  printf '%s' "$value"
+}
+
+write_systemd_units() {
+  cat > /etc/systemd/system/hotspot-captive-portal.service <<EOF
+[Unit]
+Description=Hotspot Auth Portal
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$PROJECT_DIR
+EnvironmentFile=$PROJECT_DIR/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=$PROJECT_DIR/.venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8080 --workers 4 --log-level warning --no-access-log
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  cat > /etc/systemd/system/hotspot-cleanup-worker.service <<EOF
+[Unit]
+Description=Hotspot Cleanup Worker
+After=network.target
+
+[Service]
+WorkingDirectory=$PROJECT_DIR
+EnvironmentFile=$PROJECT_DIR/.env
+ExecStart=$PROJECT_DIR/.venv/bin/python $PROJECT_DIR/workers/cleanup_worker.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  cat > /etc/systemd/system/hotspot-mikrotik-sync-worker.service <<EOF
+[Unit]
+Description=Hotspot MikroTik Sync Worker
+After=network.target
+
+[Service]
+WorkingDirectory=$PROJECT_DIR
+EnvironmentFile=$PROJECT_DIR/.env
+ExecStart=$PROJECT_DIR/.venv/bin/python $PROJECT_DIR/workers/mikrotik_sync_worker.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  chmod 644 \
+    /etc/systemd/system/hotspot-captive-portal.service \
+    /etc/systemd/system/hotspot-cleanup-worker.service \
+    /etc/systemd/system/hotspot-mikrotik-sync-worker.service
+
+  echo "Installed systemd units for $PROJECT_DIR"
+}
+
 echo "[1/4] Preparing virtual environment"
 if [ ! -d ".venv" ]; then
   python3 -m venv .venv
@@ -98,51 +181,53 @@ pip install --upgrade pip --default-timeout=100 --retries 10
 pip install -r requirements.txt --default-timeout=100 --retries 10
 
 echo
-echo "[3/4] Configuring application"
-APP_NAME_VAL=$(prompt_with_default "Application name" "Hotspot Captive Portal")
-DB_PATH_VAL=$(prompt_with_default "Database path" "hotspot.db")
-
-GENERATED_APP_SECRET=$(generate_app_secret)
-GENERATED_ADMIN_PASSWORD=$(generate_admin_password)
-
-APP_SECRET_VAL=$(prompt_secret_generated "App secret" "$GENERATED_APP_SECRET")
-ADMIN_USERNAME_VAL=$(prompt_with_default "Admin username" "admin")
-ADMIN_PASSWORD_VAL=$(prompt_secret_generated "Admin password" "$GENERATED_ADMIN_PASSWORD")
-ADMIN_COOKIE_VAL=$(prompt_with_default "Admin cookie name" "hotspot_admin")
-VOUCHER_SECRET_KEY_VAL=$(generate_fernet_key)
-
+ADMIN_USERNAME_VAL="admin"
 ADMIN_PASSWORD_WAS_GENERATED=0
-if [ "$ADMIN_PASSWORD_VAL" = "$GENERATED_ADMIN_PASSWORD" ]; then
-  ADMIN_PASSWORD_WAS_GENERATED=1
+
+if [ -f ".env" ]; then
+  echo "[3/4] Existing .env found; keeping application configuration."
+  ADMIN_USERNAME_VAL=$(read_env_value "ADMIN_USERNAME" "admin")
+else
+  echo "[3/4] Configuring application"
+  APP_NAME_VAL=$(prompt_with_default "Application name" "Hotspot Captive Portal")
+  DB_PATH_VAL=$(prompt_with_default "Database path" "hotspot.db")
+
+  GENERATED_APP_SECRET=$(generate_app_secret)
+  GENERATED_ADMIN_PASSWORD=$(generate_admin_password)
+
+  APP_SECRET_VAL=$(prompt_secret_generated "App secret" "$GENERATED_APP_SECRET")
+  ADMIN_USERNAME_VAL=$(prompt_with_default "Admin username" "admin")
+  ADMIN_PASSWORD_VAL=$(prompt_secret_generated "Admin password" "$GENERATED_ADMIN_PASSWORD")
+  ADMIN_COOKIE_VAL=$(prompt_with_default "Admin cookie name" "hotspot_admin")
+  VOUCHER_SECRET_KEY_VAL=$(generate_fernet_key)
+
+  if [ "$ADMIN_PASSWORD_VAL" = "$GENERATED_ADMIN_PASSWORD" ]; then
+    ADMIN_PASSWORD_WAS_GENERATED=1
+  fi
+
+  DEVICE_LIMIT_VAL=$(prompt_with_default "Device limit per phone" "3")
+  PENDING_MINUTES_VAL=$(prompt_with_default "Pending auth timeout (minutes)" "10")
+
+  escape_env() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+  }
+
+  {
+    echo "APP_NAME=\"$(escape_env "$APP_NAME_VAL")\""
+    echo "DB_PATH=\"$(escape_env "$DB_PATH_VAL")\""
+
+    echo "APP_SECRET=\"$(escape_env "$APP_SECRET_VAL")\""
+    echo "ADMIN_USERNAME=\"$(escape_env "$ADMIN_USERNAME_VAL")\""
+    echo "ADMIN_PASSWORD=\"$(escape_env "$ADMIN_PASSWORD_VAL")\""
+    echo "ADMIN_COOKIE=\"$(escape_env "$ADMIN_COOKIE_VAL")\""
+
+    echo "VOUCHER_SECRET_KEY=\"$(escape_env "$VOUCHER_SECRET_KEY_VAL")\""
+
+    echo "DEVICE_LIMIT=\"$(escape_env "$DEVICE_LIMIT_VAL")\""
+    echo "PENDING_MINUTES=\"$(escape_env "$PENDING_MINUTES_VAL")\""
+
+  } > .env
 fi
-
-DEVICE_LIMIT_VAL=$(prompt_with_default "Device limit per phone" "3")
-PENDING_MINUTES_VAL=$(prompt_with_default "Pending auth timeout (minutes)" "10")
-
-
-
-
-escape_env() {
-  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
-}
-
-rm -f .env
-
-{
-  echo "APP_NAME=\"$(escape_env "$APP_NAME_VAL")\""
-  echo "DB_PATH=\"$(escape_env "$DB_PATH_VAL")\""
-
-  echo "APP_SECRET=\"$(escape_env "$APP_SECRET_VAL")\""
-  echo "ADMIN_USERNAME=\"$(escape_env "$ADMIN_USERNAME_VAL")\""
-  echo "ADMIN_PASSWORD=\"$(escape_env "$ADMIN_PASSWORD_VAL")\""
-  echo "ADMIN_COOKIE=\"$(escape_env "$ADMIN_COOKIE_VAL")\""
-
-  echo "VOUCHER_SECRET_KEY=\"$(escape_env "$VOUCHER_SECRET_KEY_VAL")\""
-
-  echo "DEVICE_LIMIT=\"$(escape_env "$DEVICE_LIMIT_VAL")\""
-  echo "PENDING_MINUTES=\"$(escape_env "$PENDING_MINUTES_VAL")\""
-
-} > .env
 
 mkdir -p backups docs deploy workers
 
@@ -160,24 +245,7 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 0
 fi
 
-install_service() {
-  local src="$1"
-  local dst="$2"
-
-  if [ ! -f "$src" ]; then
-    echo "Missing service file: $src"
-    exit 1
-  fi
-
-  cp "$src" "$dst"
-  chmod 644 "$dst"
-  echo "Installed $dst"
-}
-
-install_service "deploy/hotspot-captive-portal.service" "/etc/systemd/system/hotspot-captive-portal.service"
-install_service "deploy/hotspot-cleanup-worker.service" "/etc/systemd/system/hotspot-cleanup-worker.service"
-install_service "deploy/hotspot-mikrotik-sync-worker.service" "/etc/systemd/system/hotspot-mikrotik-sync-worker.service"
-
+write_systemd_units
 systemctl daemon-reload
 
 systemctl enable --now hotspot-captive-portal.service
