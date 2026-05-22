@@ -23,16 +23,58 @@ prompt_with_default() {
   printf '%s' "$value"
 }
 
-prompt_secret_with_default() {
+prompt_secret_generated() {
   local prompt="$1"
-  local default="$2"
+  local generated="$2"
   local value
-  read -r -s -p "$prompt [$default]: " value
+  read -r -s -p "$prompt [press Enter to generate]: " value
   printf '\n' >&2
   if [ -z "$value" ]; then
-    value="$default"
+    value="$generated"
   fi
   printf '%s' "$value"
+}
+
+generate_app_secret() {
+  python3 - <<'PY'
+import secrets
+print(secrets.token_urlsafe(48))
+PY
+}
+
+generate_admin_password() {
+  python3 - <<'PY'
+import secrets
+import string
+
+alphabet = string.ascii_letters + string.digits
+print("".join(secrets.choice(alphabet) for _ in range(18)))
+PY
+}
+
+generate_fernet_key() {
+  python3 - <<'PY'
+from cryptography.fernet import Fernet
+print(Fernet.generate_key().decode("ascii"))
+PY
+}
+
+print_next_steps() {
+  echo
+  echo "Admin panel:"
+  echo "  URL: http://SERVER_IP:8080/admin/login"
+  echo "  Username: $ADMIN_USERNAME_VAL"
+
+  if [ "$ADMIN_PASSWORD_WAS_GENERATED" = "1" ]; then
+    echo "  Password: $ADMIN_PASSWORD_VAL"
+  else
+    echo "  Password: value entered during setup"
+  fi
+
+  echo
+  echo "Useful commands:"
+  echo "  systemctl status hotspot-captive-portal.service"
+  echo "  journalctl -u hotspot-captive-portal.service -f"
 }
 
 echo "[1/4] Preparing virtual environment"
@@ -60,15 +102,19 @@ echo "[3/4] Configuring application"
 APP_NAME_VAL=$(prompt_with_default "Application name" "Hotspot Captive Portal")
 DB_PATH_VAL=$(prompt_with_default "Database path" "hotspot.db")
 
-APP_SECRET_VAL=$(prompt_secret_with_default "App secret" "change_me")
+GENERATED_APP_SECRET=$(generate_app_secret)
+GENERATED_ADMIN_PASSWORD=$(generate_admin_password)
+
+APP_SECRET_VAL=$(prompt_secret_generated "App secret" "$GENERATED_APP_SECRET")
 ADMIN_USERNAME_VAL=$(prompt_with_default "Admin username" "admin")
-ADMIN_PASSWORD_VAL=$(prompt_secret_with_default "Admin password" "change_me")
+ADMIN_PASSWORD_VAL=$(prompt_secret_generated "Admin password" "$GENERATED_ADMIN_PASSWORD")
 ADMIN_COOKIE_VAL=$(prompt_with_default "Admin cookie name" "hotspot_admin")
-VOUCHER_SECRET_KEY_VAL=$(python3 - <<'PY'
-import secrets
-print(secrets.token_hex(32))
-PY
-)
+VOUCHER_SECRET_KEY_VAL=$(generate_fernet_key)
+
+ADMIN_PASSWORD_WAS_GENERATED=0
+if [ "$ADMIN_PASSWORD_VAL" = "$GENERATED_ADMIN_PASSWORD" ]; then
+  ADMIN_PASSWORD_WAS_GENERATED=1
+fi
 
 DEVICE_LIMIT_VAL=$(prompt_with_default "Device limit per phone" "3")
 PENDING_MINUTES_VAL=$(prompt_with_default "Pending auth timeout (minutes)" "10")
@@ -110,6 +156,7 @@ if [ "$(id -u)" -ne 0 ]; then
   echo "To run manually:"
   echo "  source .venv/bin/activate"
   echo "  python -m uvicorn app:app --host 0.0.0.0 --port 8080"
+  print_next_steps
   exit 0
 fi
 
@@ -142,3 +189,4 @@ echo "Setup complete."
 echo
 echo "Services:"
 systemctl --no-pager --type=service --state=running | grep -E "hotspot-captive-portal|hotspot-cleanup-worker|hotspot-mikrotik-sync-worker" || true
+print_next_steps
