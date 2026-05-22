@@ -1,35 +1,89 @@
 import hashlib
 import hmac
+import base64
+import json
 import os
+import time
 from datetime import datetime, timezone
 
-from hashlib import sha256
-
 from fastapi import Request
-from fastapi.responses import RedirectResponse, HTMLResponse
+from fastapi.responses import RedirectResponse
 
-from config import APP_SECRET, ADMIN_USERNAME, ADMIN_PASSWORD, ADMIN_COOKIE
+from config import APP_SECRET, ADMIN_COOKIE
 
 
-def make_admin_token(username: str, role: str) -> str:
-    raw = f"{username}:{role}:{APP_SECRET}"
-    sig = sha256(raw.encode()).hexdigest()
-    return f"{sig}:{username}:{role}"
+ADMIN_SESSION_TTL_SECONDS = int(os.getenv("ADMIN_SESSION_TTL_SECONDS", str(60 * 60 * 8)))
+
+
+def _b64encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _b64decode(raw: str) -> bytes:
+    padding = "=" * (-len(raw) % 4)
+    return base64.urlsafe_b64decode(raw + padding)
+
+
+def _sign_payload(payload: str) -> str:
+    digest = hmac.new(
+        APP_SECRET.encode("utf-8"),
+        payload.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    return _b64encode(digest)
+
+
+def make_admin_token(username: str, role: str, ttl_seconds: int | None = None) -> str:
+    ttl = ADMIN_SESSION_TTL_SECONDS if ttl_seconds is None else int(ttl_seconds)
+    payload = {
+        "username": username,
+        "role": role,
+        "expires_at": int(time.time()) + ttl,
+    }
+    payload_raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    payload_b64 = _b64encode(payload_raw)
+    return f"v2.{payload_b64}.{_sign_payload(payload_b64)}"
+
+
+def _active_admin_role(username: str) -> str | None:
+    from db import fetch_one
+
+    row = fetch_one(
+        """
+        SELECT role
+        FROM admin_users
+        WHERE username = ?
+          AND is_active = 1
+        """,
+        (username,),
+    )
+    return row["role"] if row else None
 
 
 def parse_admin_token(token: str):
-    if not token or ":" not in token:
+    if not token or not token.startswith("v2."):
         return None, None
 
     try:
-        sig, username, role = token.split(":", 2)
-        raw = f"{username}:{role}:{APP_SECRET}"
-        expected = sha256(raw.encode()).hexdigest()
+        _, payload_b64, signature = token.split(".", 2)
+        expected = _sign_payload(payload_b64)
 
-        if sig != expected:
+        if not hmac.compare_digest(signature, expected):
             return None, None
 
-        return username, role
+        payload = json.loads(_b64decode(payload_b64).decode("utf-8"))
+        username = str(payload.get("username") or "")
+        role = str(payload.get("role") or "")
+        expires_at = int(payload.get("expires_at") or 0)
+
+        if not username or not role or time.time() > expires_at:
+            return None, None
+
+        active_role = _active_admin_role(username)
+        if active_role != role:
+            return None, None
+
+        return username, active_role
     except Exception:
         return None, None
 
@@ -157,4 +211,3 @@ def bootstrap_admin_users():
 
     conn.commit()
     conn.close()
-

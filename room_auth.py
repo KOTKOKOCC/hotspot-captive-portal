@@ -1,10 +1,10 @@
-import sqlite3
 from datetime import datetime, timedelta
-from config import DB_PATH
+
+from db import db
 
 
 def ensure_room_auth_table():
-    conn = sqlite3.connect(DB_PATH)
+    conn = db()
     conn.execute("""
     CREATE TABLE IF NOT EXISTS room_auth (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -29,7 +29,7 @@ def ensure_room_auth_table():
 
 def save_verified_room_auth(room_num, surname, surname_norm, mac, ip, nas_id="", hotel="Dusit", ttl_minutes=15):
     expires_at = (datetime.utcnow() + timedelta(minutes=ttl_minutes)).isoformat()
-    conn = sqlite3.connect(DB_PATH)
+    conn = db()
     conn.execute("""
         INSERT INTO room_auth (room_num, surname, surname_norm, mac, ip, nas_id, hotel, status, expires_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, 'verified', ?)
@@ -39,8 +39,7 @@ def save_verified_room_auth(room_num, surname, surname_norm, mac, ip, nas_id="",
 
 def get_verified_room_auth(mac, ip):
     now = datetime.utcnow().isoformat()
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = db()
     cur = conn.cursor()
     cur.execute("""
         SELECT *

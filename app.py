@@ -96,6 +96,7 @@ from config import (
 
 from admin_auth import (
     make_admin_token,
+    ADMIN_SESSION_TTL_SECONDS,
     admin_guard,
     role_guard,
     get_current_admin_user,
@@ -1003,7 +1004,7 @@ def admin_login(username: str = Form(...), password: str = Form(...)):
         httponly=True,
         samesite="lax",
         secure=False,
-        max_age=60 * 60 * 8
+        max_age=ADMIN_SESSION_TTL_SECONDS
     )
 
     return resp
@@ -4477,6 +4478,8 @@ def admin_system_users_toggle(
     ))
     conn.commit()
     conn.close()
+
+    return RedirectResponse(url="/admin/system?section=users&ok=updated", status_code=303)
 
 
 @app.post("/admin/system/users/delete")

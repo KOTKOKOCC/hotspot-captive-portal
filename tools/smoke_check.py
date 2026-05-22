@@ -104,6 +104,36 @@ def check_secrets(strict: bool) -> None:
         ok("application secrets are not default placeholders")
 
 
+def check_admin_tokens() -> None:
+    from admin_auth import (
+        bootstrap_admin_users,
+        ensure_admin_users_table,
+        make_admin_token,
+        parse_admin_token,
+    )
+    from config import ADMIN_USERNAME
+
+    ensure_admin_users_table()
+    bootstrap_admin_users()
+
+    token = make_admin_token(ADMIN_USERNAME, "superadmin")
+    username, role = parse_admin_token(token)
+    if username != ADMIN_USERNAME or role != "superadmin":
+        fail("fresh admin token was not accepted")
+
+    if parse_admin_token(token + "x") != (None, None):
+        fail("tampered admin token was accepted")
+
+    expired = make_admin_token(ADMIN_USERNAME, "superadmin", ttl_seconds=-1)
+    if parse_admin_token(expired) != (None, None):
+        fail("expired admin token was accepted")
+
+    if parse_admin_token(f"{'0' * 64}:{ADMIN_USERNAME}:superadmin") != (None, None):
+        fail("legacy admin token was accepted")
+
+    ok("admin session tokens are signed, expiring, and database-backed")
+
+
 def fetch_no_redirect(url: str):
     opener = urllib.request.build_opener(NoRedirect)
     request = urllib.request.Request(url, method="GET")
@@ -137,6 +167,7 @@ def main() -> None:
 
     check_routes()
     check_secrets(strict=args.strict_secrets)
+    check_admin_tokens()
 
     if args.base_url:
         check_http(args.base_url)
