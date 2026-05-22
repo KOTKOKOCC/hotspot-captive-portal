@@ -35,6 +35,11 @@ COLUMN_LABELS = {
     "acct_session_time": "Длительность, сек",
     "last_auth_at": "Последний допуск",
     "device_name": "Имя устройства",
+    "first_seen": "Подключено",
+    "last_seen": "Последняя активность",
+    "room_num": "Номер комнаты",
+    "surname": "Фамилия",
+    "terminate_cause_raw": "Причина завершения raw",
     }
 
 
@@ -49,6 +54,12 @@ EVENT_LABELS = {
     "radius_reject_pending_waiting_call": "Ожидание звонка",
     "radius_reject_pending_expired": "Отклонено: заявка просрочена",
     "radius_reject_device_limit": "Отклонено: превышен лимит устройств",
+    "radius_accept_voucher": "Вход по ваучеру разрешён",
+    "radius_reject_voucher": "Вход по ваучеру отклонён",
+    "radius_reject_voucher_device_limit": "Отклонено: лимит устройств ваучера",
+    "admin_create_voucher": "Создан ваучер",
+    "admin_revoke_voucher": "Ваучер отключён",
+    "admin_voucher_remove_device": "Устройство освобождено из ваучера",
 }
 
 
@@ -59,6 +70,7 @@ STATUS_LABELS = {
     "expired": "Истекла",
     "closed": "Закрыта",
     "blocked": "Заблокирована",
+    "revoked": "Отключена",
 }
 
 RESULT_LABELS = {
@@ -70,17 +82,42 @@ RESULT_LABELS = {
 
 AUTH_METHOD_LABELS = {
     "call": "Звонок",
+    "room": "Комната",
+    "voucher": "Ваучер",
 }
 
 
 TERMINATE_CAUSE_LABELS = {
-    "Lost-Service": "Потеря соединения",
-    "Lost Service": "Потеря соединения",
+    "Lost-Service": "Потеря сервиса",
     "Lost-Carrier": "Потеря линка",
-    "User-Request": "Отключено пользователем",
     "Admin-Reset": "Сброс администратором",
     "Session-Timeout": "Истечение времени сессии",
     "Idle-Timeout": "Таймаут неактивности",
-    "Legacy-Cleanup": "Закрыто служебной очисткой",
-    "Retest-Cleanup": "Закрыто служебно",
+
+    "Legacy-Cleanup": "Автоочистка зависшей сессии",
+    "Retest-Cleanup": "Служебное тестовое закрытие",
+    "manual_room_test_cleanup": "Служебная очистка тестовой авторизации",
+    "stale_session_cleanup": "Автоочистка зависшей сессии",
+    "user_request": "Отключено пользователем",
+
+    "lost_service": "Потеря соединения",
+    "lost_carrier": "Потеря линка",
+    "admin_reset": "Сброс администратором",
+    "session_timeout": "Истечение времени сессии",
+    "idle_timeout": "Таймаут неактивности",
+    "nas_request": "Завершено NAS",
+    "nas_reboot": "Перезагрузка NAS",
+    "cleanup": "Закрыто служебной очисткой",
+    "cleanup_legacy": "Закрыто служебной очисткой",
+    "cleanup_retest": "Закрыто служебно",
+    "duplicate_session": "Дубликат сессии",
+    "interim_timeout": "Нет accounting-обновлений",
+    "unknown": "Неизвестная причина",
+
+    "stale_active_cleanup": "Автоочистка старой активной сессии",
+    "stale_session_cleanup": "Автоочистка зависшей сессии",
+    "duplicate_active_cleanup": "Закрыт дубликат активной сессии",
+    "manual_room_test_cleanup": "Служебная очистка тестовой авторизации",
+    "user_request": "Отключено пользователем",
+    "unknown": "Неизвестная причина",
 }

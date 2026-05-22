@@ -1,5 +1,6 @@
-from io import BytesIO
+from io import StringIO, BytesIO
 from zipfile import ZipFile, ZIP_DEFLATED
+import csv
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -157,7 +158,7 @@ def build_export_zip(date_from: str | None = None, date_to: str | None = None):
     ))
 
     bio = BytesIO()
-    with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
+    with ZipFile(bio, "w", ZIP_DEFLATED) as zf:
         for filename, rows, cols in files:
             zf.writestr(filename, rows_to_csv_bytes(rows, cols))
 

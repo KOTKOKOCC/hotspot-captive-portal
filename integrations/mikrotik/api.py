@@ -1,20 +1,32 @@
 import time
 import threading
 import routeros_api
+import logging
 
 from db import db
-from config import MT_HOST, MT_PORT, MT_USER, MT_PASS, DEVICE_SYNC_INTERVAL
+from app_services.settings_store import get_setting
+
+logger = logging.getLogger(__name__)
 
 
-
+def get_mt_config():
+    return {
+        "host": get_setting("mikrotik.host", ""),
+        "port": int(get_setting("mikrotik.port", "8728")),
+        "user": get_setting("mikrotik.user", ""),
+        "password": get_setting("mikrotik.password", ""),
+        "device_sync_interval": int(get_setting("mikrotik.device_sync_interval", "300")),
+    }
 
 
 def mt_api():
+    cfg = get_mt_config()
+
     connection = routeros_api.RouterOsApiPool(
-        MT_HOST,
-        username=MT_USER,
-        password=MT_PASS,
-        port=MT_PORT,
+        cfg["host"],
+        username=cfg["user"],
+        password=cfg["password"],
+        port=cfg["port"],
         plaintext_login=True
     )
     return connection
@@ -97,14 +109,66 @@ def device_name_sync_worker():
     while True:
         try:
             updated = sync_session_device_names()
-            print(f"[mikrotik-sync] updated: {updated}")
+            logger.info("mikrotik sync updated: %s", updated)
         except Exception as e:
-            print(f"[mikrotik-sync] waiting for MikroTik: {e}")
+            logger.warning("mikrotik sync waiting for MikroTik: %s", e)
 
-        time.sleep(DEVICE_SYNC_INTERVAL)
-
+        time.sleep(get_mt_config()["device_sync_interval"])
+        
 
 def start_device_name_sync_worker():
     t = threading.Thread(target=device_name_sync_worker, daemon=True)
     t.start()
     return t
+
+
+def disconnect_hotspot_active_by_mac(mac: str) -> int:
+    mac = (mac or "").upper().strip()
+    if not mac:
+        return 0
+
+    pool = None
+    removed = 0
+
+    try:
+        pool = mt_api()
+        api = pool.get_api()
+        active_res = api.get_resource("/ip/hotspot/active")
+
+        rows = active_res.get()
+        for row in rows:
+            row_mac = (row.get("mac-address", "") or "").upper().strip()
+            if row_mac == mac:
+                active_res.remove(id=row["id"])
+                removed += 1
+
+        return removed
+    finally:
+        if pool:
+            pool.disconnect()
+
+
+def fetch_hotspot_active():
+    pool = None
+    try:
+        pool = mt_api()
+        api = pool.get_api()
+
+        active_res = api.get_resource("/ip/hotspot/active")
+        rows = active_res.get()
+
+        result = []
+        for row in rows:
+            result.append({
+                "server": row.get("server", ""),
+                "user": row.get("user", ""),
+                "address": row.get("address", ""),
+                "mac": (row.get("mac-address", "") or "").upper(),
+                "uptime": row.get("uptime", ""),
+                "idle_time": row.get("idle-time", ""),
+            })
+
+        return result
+    finally:
+        if pool:
+            pool.disconnect()

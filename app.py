@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Query, Request, Form, Header
+from fastapi import FastAPI, HTTPException, Query, Request, Form, Body
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 from datetime import datetime, timedelta, timezone
@@ -8,7 +8,43 @@ import re
 import threading
 import ipaddress
 from urllib.parse import quote
-from typing import Optional
+from fastapi.staticfiles import StaticFiles
+import subprocess
+import sqlite3
+import select
+import os
+
+import logging
+
+from system_info import (
+    get_disk_usage,
+    get_memory_usage,
+    get_cpu_load,
+    get_uptime,
+    disk_status_class,
+    human_bytes,
+)
+
+from app_services.settings_store import (
+    get_setting,
+    set_setting,
+    init_settings_table,
+)
+
+from app_services.onec_store import (
+    init_onec_sites_table,
+    list_onec_sites,
+    upsert_onec_site,
+    delete_onec_site,
+    get_onec_site_by_code,
+)
+
+from app_services.opera_store import (
+    init_opera_sites_table,
+    list_opera_sites,
+    upsert_opera_site,
+    delete_opera_site,
+)
 
 
 from labels import (
@@ -26,7 +62,10 @@ from db import (
     fetch_one,
     init_db,
     ensure_guests_last_auth_at,
+    ensure_guests_auth_columns,
     ensure_guest_sessions_device_name,
+    ensure_guest_sessions_room_auth_columns,
+    ensure_terminate_cause_columns,
 )
 
 from exports import (
@@ -35,24 +74,37 @@ from exports import (
     build_export_zip,
 )
 
-from mikrotik_api import (
-    sync_session_device_names,
-    start_device_name_sync_worker,
+from integrations.mikrotik.api import (
     fetch_dhcp_leases,
     mt_api,
+    disconnect_hotspot_active_by_mac,
+    fetch_hotspot_active,
 )
 
 from config import (
     APP_NAME,
     APP_SECRET,
+    DB_PATH,
+    OPERA_CACHE_DB_PATH,
     ADMIN_USERNAME,
     ADMIN_PASSWORD,
     ADMIN_COOKIE,
     DEVICE_LIMIT,
     PENDING_MINUTES,
+    PBX_ALLOWED_IPS,
 )
 
-from admin_auth import make_admin_token, check_admin_token, admin_guard
+from admin_auth import (
+    make_admin_token,
+    admin_guard,
+    role_guard,
+    get_current_admin_user,
+    ensure_admin_users_table,
+    bootstrap_admin_users,
+    verify_admin_password,
+    hash_admin_password,
+)
+
 
 from services import (
     DISPLAY_TZ,
@@ -60,9 +112,6 @@ from services import (
     resolve_network_info,
     audit,
     save_radius_accounting,
-    cleanup_db,
-    cleanup_stale_sessions,
-    run_cleanup,
     get_guest_last_activity,
     accept_reply,
 )
@@ -80,6 +129,9 @@ from auth import (
     active_sessions_count,
     start_session,
     update_session,
+    get_or_create_room_guest,
+    make_room_identity,
+    get_recent_authorized_session_by_mac,
 )
 
 from ui import (
@@ -88,10 +140,44 @@ from ui import (
     admin_page,
 )
 
+from integrations.opera.lookup import room_auth_allowed, normalize_user_surname
+from room_auth import ensure_room_auth_table, save_verified_room_auth, get_verified_room_auth
+from integrations.pms.router import pms_room_auth_allowed
 
+from vouchers import (
+    ensure_voucher_tables,
+    create_voucher,
+    verify_voucher_radius,
+    format_voucher_code,
+    decrypt_voucher_code,
+)
+
+from logging_config import setup_logging
+
+setup_logging()
+logger = logging.getLogger(__name__)
+
+
+def mask_phone(phone: str | None) -> str:
+    digits = re.sub(r"\D", "", str(phone or ""))
+    return digits or "-"
+
+def log_phone_event(event: str, phone: str | None = None, **fields):
+    safe_fields = {
+        key: value
+        for key, value in fields.items()
+        if value not in (None, "")
+    }
+
+    parts = [f"phone={mask_phone(phone)}"]
+    parts.extend(f"{key}={value}" for key, value in safe_fields.items())
+
+    logger.info("%s %s", event, " ".join(parts))
 
 
 app = FastAPI()
+ensure_room_auth_table()
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 class CallIn(BaseModel):
@@ -100,6 +186,7 @@ class CallIn(BaseModel):
 
 class RadiusCheckIn(BaseModel):
     username: str
+    password: str | None = None
     mac: str
     ip: str | None = None
     nas_id: str | None = None
@@ -122,40 +209,760 @@ class RadiusAccountingIn(BaseModel):
     event_time: str | None = None
 
 
+@app.get("/admin/system/disk")
+def admin_system_disk(request: Request):
+    guard = role_guard(request, ("admin", "superadmin", "it"))
+    if guard:
+        return guard
+
+    return get_disk_usage("/")
+
+
+def systemctl_is_active(unit: str) -> str:
+    try:
+        r = subprocess.run(
+            ["systemctl", "is-active", unit],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return (r.stdout or "").strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def service_badge(status: str) -> str:
+    if status == "active":
+        return '<span class="badge active">active</span>'
+    if status in ("inactive", "failed"):
+        return f'<span class="badge error">{escape(status)}</span>'
+    return f'<span class="badge pending">{escape(status)}</span>'
+
+
+def get_wal_size() -> dict:
+    path = DB_PATH + "-wal"
+    if not os.path.exists(path):
+        return {"bytes": 0, "text": "0 B"}
+
+    size = os.path.getsize(path)
+    return {"bytes": size, "text": human_bytes(size)}
+
+@app.get("/admin/system/service/status-json")
+def admin_system_service_status_json(request: Request):
+    guard = role_guard(request, ("superadmin", "it"))
+    if guard:
+        return {"ok": False, "error": "forbidden"}
+
+    disk = get_disk_usage("/")
+    memory = get_memory_usage()
+    cpu = get_cpu_load()
+    uptime = get_uptime()
+    wal = get_wal_size()
+
+    services = [
+        ("portal", "hotspot-captive-portal.service"),
+        ("cleanup", "hotspot-cleanup-worker.service"),
+        ("mikrotik", "hotspot-mikrotik-sync-worker.service"),
+        ("opera", "opera-fias-sync.service"),
+        ("freeradius", "freeradius.service"),
+    ]
+
+    return {
+        "ok": True,
+        "cpu": cpu,
+        "memory": memory,
+        "disk": disk,
+        "uptime": uptime,
+        "wal": wal,
+        "services": {
+            key: systemctl_is_active(unit)
+            for key, unit in services
+        },
+    }
+
+
 @app.get("/")
 def root():
     return RedirectResponse(url="/admin/login", status_code=302)
 
 
+def get_opera_fias_status():
+    status = {
+        "service_active": False,
+        "last_event": "",
+        "event_count": 0,
+        "raw_count": 0,
+        "socket_established": False,
+    }
+
+    try:
+        r = subprocess.run(
+            ["systemctl", "is-active", "opera-fias-sync.service"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        status["service_active"] = r.stdout.strip() == "active"
+    except Exception:
+        pass
+
+    opera_socket = ""
+
+    try:
+        opera_sites = list_opera_sites()
+        opera_site = next((s for s in opera_sites if s.get("enabled")), None)
+
+        if opera_site:
+            opera_host = str(opera_site.get("host") or "")
+            opera_port = str(opera_site.get("port") or "")
+            if opera_host and opera_port:
+                opera_socket = f"{opera_host}:{opera_port}"
+    except Exception:
+        pass
+
+    try:
+        r = subprocess.run(
+            ["ss", "-tanp"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        status["socket_established"] = bool(
+            opera_socket and opera_socket in r.stdout and "ESTAB" in r.stdout
+        )
+    except Exception:
+        pass
+
+    try:
+        db = OPERA_CACHE_DB_PATH
+        conn = sqlite3.connect(db)
+
+        row = conn.execute("SELECT count(*), max(received_at) FROM opera_events").fetchone()
+        if row:
+            status["event_count"] = row[0] or 0
+            status["last_event"] = row[1] or ""
+
+        row = conn.execute("SELECT count(*) FROM opera_raw_events").fetchone()
+        if row:
+            status["raw_count"] = row[0] or 0
+
+        conn.close()
+    except Exception:
+        pass
+
+    return status
+
+_ONEC_STATUS_CACHE = {}
+
+
+def check_onec_site_status(site: dict) -> bool:
+    if not site.get("enabled"):
+        return False
+
+    site_id = site.get("id")
+    base_url = site.get("base_url") or ""
+    token = site.get("token") or ""
+
+    if not base_url or not token:
+        return False
+
+    import time
+    import requests
+
+    now = time.time()
+    cache_key = str(site_id or base_url)
+
+    cached = _ONEC_STATUS_CACHE.get(cache_key)
+    if cached and now - cached["ts"] < 60:
+        return cached["ok"]
+
+    try:
+        r = requests.get(
+            base_url,
+            params={
+                "token": token,
+                "room": "__healthcheck__",
+                "LastName": "__healthcheck__",
+            },
+            timeout=2,
+        )
+
+        ok = False
+
+        if r.status_code < 500:
+            try:
+                data = r.json()
+                err = str(data.get("Error", "")).lower()
+
+                bad_token_markers = [
+                    "invalid token",
+                    "wrong token",
+                    "token disabled",
+                    "access denied",
+                    "unauthorized",
+                    "forbidden",
+                    "неверный токен",
+                    "failed to find interaction parameters",
+                    "interaction parameters",
+                ]
+
+                if not any(marker in err for marker in bad_token_markers):
+                    ok = True
+            except Exception:
+                ok = False
+
+        _ONEC_STATUS_CACHE[cache_key] = {
+            "ts": now,
+            "ok": ok,
+        }
+
+        return ok
+
+    except Exception:
+        _ONEC_STATUS_CACHE[cache_key] = {
+            "ts": now,
+            "ok": False,
+        }
+
+        return False
+
+def build_settings_body(ok: str = ""):
+
+    mt_host = escape(str(get_setting("mikrotik.host", "")))
+    mt_port = escape(str(get_setting("mikrotik.port", "8728")))
+    mt_user = escape(str(get_setting("mikrotik.user", "")))
+    mt_interval = escape(str(get_setting("mikrotik.device_sync_interval", "300")))
+
+    ok_html = ""
+    if ok:
+        ok_html = """
+        <div class="notice success" style="margin-bottom:14px;">
+          Настройки сохранены.
+        </div>
+        """
+
+    onec_sites = list_onec_sites()
+
+    onec_rows = ""
+    for site in onec_sites:
+        site_for_check = get_onec_site_by_code(site["code"])
+        status_dot = "🟢" if site_for_check and check_onec_site_status(site_for_check) else "🔴"
+        enabled_text = "Да" if site["enabled"] else "Нет"
+
+        onec_rows += f"""
+        <tr>
+          <td>{status_dot} {escape(site["name"])}</td>
+          <td><code>{escape(site["code"])}</code></td>
+          <td>{escape(site["base_url"])}</td>
+          <td>{escape(site["token_masked"])}</td>
+          <td>{enabled_text}</td>
+          <td>{site["timeout"]}</td>
+          <td>
+            <form method="post" action="/admin/settings/onec/delete" style="display:inline;">
+              <input type="hidden" name="site_id" value="{site["id"]}">
+              <button type="submit" class="btn btn-danger"
+                onclick="return confirm('Удалить объект 1C?')">Удалить</button>
+            </form>
+          </td>
+        </tr>
+        """
+
+    if not onec_rows:
+        onec_rows = """
+        <tr>
+          <td colspan="7" class="muted">Объекты 1C пока не добавлены.</td>
+        </tr>
+        """    
+
+    opera_sites = list_opera_sites()
+
+    opera_rows = ""
+    for site in opera_sites:
+        opera_status = get_opera_fias_status()
+        opera_is_ok = (
+            site["enabled"]
+            and opera_status["service_active"]
+            and opera_status["socket_established"]
+        )
+        status_dot = "🟢" if opera_is_ok else "🔴"
+        enabled_text = "Да" if site["enabled"] else "Нет"
+        ssl_text = "Да" if site["use_ssl"] else "Нет"
+
+        opera_rows += f"""
+        <tr>
+          <td>{status_dot} {escape(site["name"])}</td>
+          <td><code>{escape(site["code"])}</code></td>
+          <td>{escape(site["host"])}</td>
+          <td>{site["port"]}</td>
+          <td>{ssl_text}</td>
+          <td>{escape(site["property_code"])}</td>
+          <td>{escape(site["auth_key_masked"])}</td>
+          <td>{enabled_text}</td>
+          <td>
+            <form method="post" action="/admin/settings/opera/delete" style="display:inline;">
+              <input type="hidden" name="site_id" value="{site["id"]}">
+              <button type="submit" class="btn btn-danger"
+                onclick="return confirm('Удалить Opera/FIAS объект?')">
+                Удалить
+              </button>
+            </form>
+          </td>
+        </tr>
+        """
+
+    if not opera_rows:
+        opera_rows = """
+        <tr>
+          <td colspan="9" class="muted">
+            Opera / FIAS объекты пока не добавлены.
+          </td>
+        </tr>
+        """
+
+    opera_status = get_opera_fias_status()
+
+    opera_status_color = "🟢" if (
+        opera_status["service_active"] and opera_status["socket_established"]
+    ) else "🔴"
+
+    opera_status_html = f"""
+      <div class="notice" style="margin:12px 0;">
+        <b>{opera_status_color} Opera/FIAS статус</b><br>
+        Service: {"active" if opera_status["service_active"] else "inactive"}<br>
+        TCP link: {"ESTAB" if opera_status["socket_established"] else "нет соединения"}<br>
+        Last RX: {escape(str(opera_status["last_event"] or "нет данных"))}<br>
+        Events: {opera_status["event_count"]}, Raw: {opera_status["raw_count"]}
+      </div>
+    """
+
+    pbx_enabled = str(get_setting("pbx.enabled", "1")) == "1"
+    pbx_allowed_ips = str(get_setting("pbx.allowed_ips", ",".join(PBX_ALLOWED_IPS)))
+
+
+    body = f"""
+    <div class="settings-page">
+
+      <div class="settings-card">
+        <h2>Настройки приложения</h2>
+        <p class="settings-muted">
+          Эти параметры сохраняются в базе данных. Если значение не задано здесь,
+          приложение использует fallback из .env.
+        </p>
+        {ok_html}
+      </div>
+
+      <div class="settings-card">
+        <form method="post" action="/admin/settings/mikrotik">
+          <h3 style="margin:0 0 12px;">MikroTik</h3>
+
+          <div class="settings-grid settings-grid-mikrotik">
+            <div class="settings-field">
+              <label>Host</label>
+              <input type="text" name="host" value="{mt_host}" placeholder="192.168.88.1">
+            </div>
+
+            <div class="settings-field">
+              <label>Port</label>
+              <input type="number" name="port" value="{mt_port}" placeholder="8728">
+            </div>
+
+            <div class="settings-field">
+              <label>User</label>
+              <input type="text" name="user" value="{mt_user}" placeholder="api-user">
+            </div>
+
+            <div class="settings-field">
+              <label>Password</label>
+              <input type="password" name="password" value="" placeholder="Оставить пустым, чтобы не менять">
+            </div>
+
+            <div class="settings-field">
+              <label>Device sync interval, sec</label>
+              <input type="number" name="device_sync_interval" value="{mt_interval}" placeholder="300">
+            </div>
+
+            <div class="settings-field" style="align-self:end;">
+              <button type="submit" class="btn btn-primary">Сохранить MikroTik</button>
+            </div>
+          </div>
+        </form>
+      </div>
+
+
+      <div class="settings-card">
+        <form method="post" action="/admin/settings/pbx">
+          <h3 style="margin:0 0 12px;">PBX / Asterisk</h3>
+
+          <div class="settings-grid settings-grid-pbx">
+            <div class="settings-field">
+              <label>Включено</label>
+              <select name="pbx_enabled">
+                <option value="1" {"selected" if pbx_enabled else ""}>Да</option>
+                <option value="0" {"" if pbx_enabled else "selected"}>Нет</option>
+              </select>
+            </div>
+
+            <div class="settings-field">
+              <label>Разрешённые IP</label>
+              <input type="text"
+                   name="pbx_allowed_ips"
+                   value="{escape(pbx_allowed_ips)}"
+                   placeholder="192.168.4.150,192.168.4.151">
+            </div>
+
+            <div class="settings-field" style="align-self:end;">
+              <button type="submit" class="btn btn-primary">Сохранить PBX</button>
+            </div>
+          </div>
+        </form>
+      </div>
+
+
+      <div class="settings-card">
+        <h3 style="margin:0 0 12px;">1C / PMS объекты</h3>
+
+        <div class="settings-table-wrap">
+          <table class="sessions-table">
+            <thead>
+              <tr>
+                <th>Имя</th>
+                <th>Код</th>
+                <th>URL</th>
+                <th>Токен</th>
+                <th>Включено</th>
+                <th>Timeout</th>
+                <th>Действия</th>
+              </tr>
+            </thead>
+            <tbody>
+              {onec_rows}
+            </tbody>
+          </table>
+        </div>
+
+        <form method="post" action="/admin/settings/onec" style="margin-top:18px;">
+          <h3 style="margin:0 0 12px;">Добавить / обновить объект 1C</h3>
+
+          <div class="settings-grid settings-grid-onec">
+            <div class="settings-field">
+              <label>Имя объекта</label>
+              <input type="text" name="name" placeholder="Gorod Mira">
+            </div>
+
+            <div class="settings-field">
+              <label>Код объекта</label>
+              <input type="text" name="code" placeholder="gorod_mira">
+            </div>
+
+            <div class="settings-field">
+              <label>Base URL</label>
+              <input type="text" name="base_url" placeholder="https://example.local/api">
+            </div>
+
+            <div class="settings-field">
+              <label>Token</label>
+              <input type="password" name="token" placeholder="Оставить пустым, чтобы не менять">
+            </div>
+
+            <div class="settings-field">
+              <label>Timeout, sec</label>
+              <input type="number" name="timeout" value="5">
+            </div>
+
+            <div class="settings-field">
+              <label>Включено</label>
+              <select name="enabled">
+                <option value="1" selected>Да</option>
+                <option value="0">Нет</option>
+              </select>
+            </div>
+
+            <div class="settings-field" style="align-self:end;">
+              <button type="submit" class="btn btn-primary">Сохранить объект 1C</button>
+            </div>
+          </div>
+        </form>
+      </div>
+
+      <div class="settings-card">
+        <h3 style="margin:0 0 12px;">Opera / FIAS объекты</h3>
+
+        <div class="settings-table-wrap">
+          <table class="sessions-table">
+            <thead>
+              <tr>
+                <th>Имя</th>
+                <th>Код</th>
+                <th>Host</th>
+                <th>Port</th>
+                <th>SSL</th>
+                <th>Property</th>
+                <th>Auth Key</th>
+                <th>Enabled</th>
+                <th>Действия</th>
+              </tr>
+            </thead>
+            <tbody>
+              {opera_rows}
+            </tbody>
+          </table>
+        </div>
+
+        <form method="post" action="/admin/settings/opera" style="margin-top:18px;">
+          <h3 style="margin:0 0 12px;">Добавить / обновить Opera объект</h3>
+
+          <div class="settings-grid settings-grid-opera">
+            <div class="settings-field">
+              <label>Имя объекта</label>
+              <input type="text" name="name" placeholder="Dusit">
+            </div>
+
+            <div class="settings-field">
+              <label>Код объекта</label>
+              <input type="text" name="code" placeholder="dusit">
+            </div>
+
+            <div class="settings-field">
+              <label>Host</label>
+              <input type="text" name="host" placeholder="192.168.0.1">
+            </div>
+
+            <div class="settings-field">
+              <label>Port</label>
+              <input type="number" name="port" value="5057">
+            </div>
+
+            <div class="settings-field">
+              <label>Property code</label>
+              <input type="text" name="property_code" placeholder="DUSIT">
+            </div>
+
+            <div class="settings-field">
+              <label>Auth key</label>
+              <input type="password" name="auth_key" placeholder="Оставить пустым, чтобы не менять">
+            </div>
+
+            <div class="settings-field">
+              <label>Connect timeout</label>
+              <input type="number" name="connect_timeout" value="10">
+            </div>
+
+            <div class="settings-field">
+              <label>Reconnect seconds</label>
+              <input type="number" name="reconnect_seconds" value="30">
+            </div>
+
+            <div class="settings-field">
+              <label>SSL</label>
+              <select name="use_ssl">
+                <option value="0" selected>Нет</option>
+                <option value="1">Да</option>
+              </select>
+            </div>
+
+            <div class="settings-field">
+              <label>Включено</label>
+              <select name="enabled">
+                <option value="1" selected>Да</option>
+                <option value="0">Нет</option>
+              </select>
+            </div>
+
+            <div class="settings-field" style="align-self:end;">
+              <button type="submit" class="btn btn-primary">Сохранить Opera объект</button>
+            </div>
+          </div>
+        </form>
+      </div>
+
+    </div>
+    """
+
+
+    return body
+
+@app.get("/admin/settings", response_class=HTMLResponse)
+def admin_settings_page(request: Request, ok: str = ""):
+    guard = role_guard(request, ("superadmin",))
+    if guard:
+        return guard
+    return RedirectResponse(url=f"/admin/system?section=settings&ok={escape(ok)}", status_code=303)
+
+
+@app.post("/admin/settings/mikrotik")
+def admin_settings_mikrotik_save(
+    request: Request,
+    host: str = Form(""),
+    port: int = Form(8728),
+    user: str = Form(""),
+    password: str = Form(""),
+    device_sync_interval: int = Form(300),
+):
+    guard = role_guard(request, ("superadmin",))
+    if guard:
+        return guard
+
+    set_setting("mikrotik.host", host.strip())
+    set_setting("mikrotik.port", port)
+    set_setting("mikrotik.user", user.strip())
+    set_setting("mikrotik.device_sync_interval", device_sync_interval)
+
+    if password.strip():
+        set_setting("mikrotik.password", password.strip(), is_secret=True)
+
+    return RedirectResponse(url="/admin/system?section=settings&ok=1", status_code=303)
+
+
+@app.post("/admin/settings/pbx")
+def admin_settings_pbx(
+    request: Request,
+    pbx_enabled: str = Form("0"),
+    pbx_allowed_ips: str = Form(""),
+):
+    guard = role_guard(request, ("superadmin",))
+    if guard:
+        return guard
+
+    set_setting("pbx.enabled", "1" if pbx_enabled == "1" else "0")
+    set_setting("pbx.allowed_ips", pbx_allowed_ips.strip())
+
+    return RedirectResponse(url="/admin/system?section=settings&ok=pbx", status_code=303)
+
+
+@app.post("/admin/settings/onec")
+def admin_settings_onec_save(
+    request: Request,
+    name: str = Form(""),
+    code: str = Form(""),
+    base_url: str = Form(""),
+    token: str = Form(""),
+    enabled: int = Form(1),
+    timeout: int = Form(5),
+):
+    guard = role_guard(request, ("superadmin",))
+    if guard:
+        return guard
+
+    if name.strip() and code.strip():
+        upsert_onec_site(
+            name=name,
+            code=code,
+            base_url=base_url,
+            token=token,
+            enabled=bool(enabled),
+            timeout=timeout,
+        )
+
+    return RedirectResponse(url="/admin/system?section=settings&ok=1", status_code=303)
+
+
+@app.post("/admin/settings/onec/delete")
+def admin_settings_onec_delete(
+    request: Request,
+    site_id: int = Form(...),
+):
+    guard = role_guard(request, ("superadmin",))
+    if guard:
+        return guard
+
+    delete_onec_site(site_id)
+
+    return RedirectResponse(url="/admin/system?section=settings&ok=1", status_code=303)
+
+
+@app.post("/admin/settings/opera")
+def admin_settings_opera_save(
+    request: Request,
+    name: str = Form(""),
+    code: str = Form(""),
+    host: str = Form(""),
+    port: int = Form(5057),
+    use_ssl: int = Form(0),
+    auth_key: str = Form(""),
+    property_code: str = Form(""),
+    enabled: int = Form(1),
+    connect_timeout: int = Form(10),
+    reconnect_seconds: int = Form(30),
+):
+    guard = role_guard(request, ("superadmin",))
+    if guard:
+        return guard
+
+    if name.strip() and code.strip() and host.strip():
+        upsert_opera_site(
+            name=name,
+            code=code,
+            host=host,
+            port=port,
+            use_ssl=bool(use_ssl),
+            auth_key=auth_key,
+            property_code=property_code,
+            enabled=bool(enabled),
+            connect_timeout=connect_timeout,
+            reconnect_seconds=reconnect_seconds,
+        )
+
+    return RedirectResponse(url="/admin/system?section=settings&ok=1", status_code=303)
+
+
+@app.post("/admin/settings/opera/delete")
+def admin_settings_opera_delete(
+    request: Request,
+    site_id: int = Form(...),
+):
+    guard = role_guard(request, ("superadmin",))
+    if guard:
+        return guard
+
+    delete_opera_site(site_id)
+
+    return RedirectResponse(url="/admin/system?section=settings&ok=1", status_code=303)
+
+
 @app.get("/admin/login", response_class=HTMLResponse)
-def admin_login_page():
-    return HTMLResponse("""
+def admin_login_page(error: str = ""):
+    error_html = ""
+
+    if error == "bad_credentials":
+        error_html = """
+        <div class="notice error" style="margin-bottom:14px; text-align:center;">
+          Неверный логин или пароль
+        </div>
+        """
+
+    elif error == "disabled":
+        error_html = """
+        <div class="notice error" style="margin-bottom:14px; text-align:center;">
+          Пользователь отключен
+        </div>
+        """
+
+    return HTMLResponse(f"""
     <!doctype html>
     <html lang="ru">
     <head>
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>Вход в админку</title>
-      <style>
-        body { font-family: Arial, sans-serif; background:#f5f7fb; margin:0; }
-        .wrap { max-width:420px; margin:80px auto; padding:20px; }
-        .card { background:#fff; border-radius:16px; padding:24px; box-shadow:0 10px 30px rgba(0,0,0,.08); }
-        h1 { margin:0 0 18px; font-size:26px; text-align:center; }
-        label { display:block; margin:12px 0 6px; font-weight:600; }
-        input { width:100%; height:44px; box-sizing:border-box; padding:0 12px; border:1px solid #cbd5e1; border-radius:10px; }
-        button { width:100%; height:46px; margin-top:16px; border:0; border-radius:10px; background:#1f4fd6; color:#fff; font-weight:700; font-size:16px; }
-      </style>
+      <title>Miracleon Captive Portal — вход</title>
+      <link rel="stylesheet" href="/static/admin.css">
     </head>
-    <body>
-      <div class="wrap">
-        <div class="card">
-          <h1>Вход в админку</h1>
+    <body class="login-page">
+      <div class="login-wrap">
+        <div class="login-card">
+          <div class="login-brand">MIRACLEON WI-FI</div>
+          <h1>Вход в панель</h1>
+          <div class="login-subtitle">Управление гостевым Wi-Fi, ваучерами и сессиями</div>
+
+          {error_html}
+
           <form method="post" action="/admin/login">
             <label>Логин</label>
-            <input type="text" name="username" required>
+            <input type="text" name="username" required autocomplete="username">
+
             <label>Пароль</label>
-            <input type="password" name="password" required>
-            <button type="submit">Войти</button>
+            <input type="password" name="password" required autocomplete="current-password">
+
+            <button class="btn primary login-btn" type="submit">Войти</button>
           </form>
         </div>
       </div>
@@ -166,18 +973,39 @@ def admin_login_page():
 
 @app.post("/admin/login")
 def admin_login(username: str = Form(...), password: str = Form(...)):
-    if username != ADMIN_USERNAME or password != ADMIN_PASSWORD:
-        return HTMLResponse("Неверный логин или пароль", status_code=401)
+    row = fetch_one("""
+        SELECT username, password_hash, role, is_active
+        FROM admin_users
+        WHERE username = ?
+    """, (username,))
 
-    resp = RedirectResponse(url="/admin", status_code=303)
+    if not row:
+        return RedirectResponse(url="/admin/login?error=bad_credentials", status_code=303)
+
+    if int(row["is_active"]) != 1:
+        return RedirectResponse(url="/admin/login?error=disabled", status_code=303)
+
+    if not verify_admin_password(password, row["password_hash"]):
+        return RedirectResponse(url="/admin/login?error=bad_credentials", status_code=303)
+
+    role = row["role"]
+
+    redirect_url = "/admin"
+
+    if role == "reception":
+        redirect_url = "/admin/vouchers"
+
+    resp = RedirectResponse(url=redirect_url, status_code=303)
+
     resp.set_cookie(
         key=ADMIN_COOKIE,
-        value=make_admin_token(username),
+        value=make_admin_token(username, role),
         httponly=True,
         samesite="lax",
         secure=False,
         max_age=60 * 60 * 8
     )
+
     return resp
 
 
@@ -190,9 +1018,11 @@ def admin_logout():
 
 @app.get("/admin/export/full")
 def admin_export_full(request: Request):
-    guard = admin_guard(request)
+    guard = role_guard(request, ("superadmin",))
     if guard:
         return guard
+
+    username, role = get_current_admin_user(request)
 
     data = build_export_zip()
     return StreamingResponse(
@@ -204,9 +1034,11 @@ def admin_export_full(request: Request):
 
 @app.get("/admin/export/period")
 def admin_export_period(request: Request, date_from: str | None = None, date_to: str | None = None):
-    guard = admin_guard(request)
+    guard = role_guard(request, ("superadmin",))
     if guard:
         return guard
+
+    username, role = get_current_admin_user(request)
 
     data = build_export_zip(date_from=date_from, date_to=date_to)
     filename = f"hotspot_export_{date_from or 'start'}_{date_to or 'end'}.zip"
@@ -220,30 +1052,47 @@ def admin_export_period(request: Request, date_from: str | None = None, date_to:
 @app.on_event("startup")
 def startup():
     init_db()
+    init_settings_table()
+    init_onec_sites_table()
+    init_opera_sites_table()
+    ensure_admin_users_table()
+    ensure_guests_auth_columns()
+    bootstrap_admin_users()
+
     ensure_guests_last_auth_at()
     ensure_guest_sessions_device_name()
-    run_cleanup()
-
-    try:
-        sync_session_device_names()
-    except Exception as e:
-        print(f"[mikrotik-sync] startup sync skipped: {e}")
-
-    try:
-        start_device_name_sync_worker()
-    except Exception as e:
-        print(f"[mikrotik-sync] worker start skipped: {e}")
-
-    try:
-        start_cleanup_worker()
-    except Exception as e:
-        print(f"[cleanup] worker start skipped: {e}")
+    ensure_guest_sessions_room_auth_columns()
+    ensure_terminate_cause_columns()
+    ensure_voucher_tables()
 
 
 @app.post("/pbx-call")
-def pbx_call(payload: CallIn):
+def pbx_call(request: Request, payload: CallIn):
+    pbx_enabled = str(get_setting("pbx.enabled", "1")) == "1"
+    pbx_allowed_ips_raw = str(get_setting("pbx.allowed_ips", ",".join(PBX_ALLOWED_IPS)))
+    pbx_allowed_ips = [
+        ip.strip()
+        for ip in pbx_allowed_ips_raw.split(",")
+        if ip.strip()
+    ]
+
+    client_ip = request.client.host if request.client else ""
+
+    log_phone_event("PHONE_CALL_RECEIVED", payload.phone, source_ip=client_ip)
+
+    if not pbx_enabled:
+        audit("pbx_disabled", ip=client_ip, details="PBX call rejected because PBX is disabled")
+        raise HTTPException(status_code=403, detail="pbx disabled")
+
+    if pbx_allowed_ips and client_ip not in pbx_allowed_ips:
+        audit("pbx_forbidden_ip", ip=client_ip, details="PBX call rejected by IP allowlist")
+        raise HTTPException(status_code=403, detail="pbx ip forbidden")
+
     try:
         phone = normalize_phone(payload.phone)
+
+        log_phone_event("PHONE_CALL_NORMALIZED", phone, source_ip=client_ip)
+
     except ValueError:
         raise HTTPException(status_code=400, detail="invalid phone")
 
@@ -260,10 +1109,13 @@ def pbx_call(payload: CallIn):
         conn.execute("""
             INSERT INTO call_events (phone, callerid_raw, source_ip, created_at, result)
             VALUES (?, ?, ?, ?, ?)
-        """, (phone, phone, None, now_iso(), "no_pending"))
+        """, (phone, phone, client_ip, now_iso(), "no_pending"))
         conn.commit()
         conn.close()
         audit("call_no_pending", phone=phone, details="PBX call without pending auth")
+
+        log_phone_event("PHONE_CALL_NO_PENDING", phone, source_ip=client_ip)
+        
         raise HTTPException(status_code=404, detail="pending not found")
 
     if now() > datetime.fromisoformat(row["expires_at"]):
@@ -271,10 +1123,22 @@ def pbx_call(payload: CallIn):
         conn.execute("""
             INSERT INTO call_events (phone, callerid_raw, source_ip, created_at, result)
             VALUES (?, ?, ?, ?, ?)
-        """, (phone, phone, None, now_iso(), "expired_pending"))
+        """, (phone, phone, client_ip, now_iso(), "expired_pending"))
         conn.commit()
         conn.close()
         audit("call_expired_pending", phone=phone, mac=row["mac"], ip=row["ip"], nas_id=row["nas_id"], hotel=row["hotel"], ssid=row["ssid"], vlan_id=row["vlan_id"], details="PBX call matched expired pending")
+
+        log_phone_event(
+            "PHONE_CALL_PENDING_EXPIRED",
+            phone,
+            source_ip=client_ip,
+            mac=row["mac"],
+            ip=row["ip"],
+            hotel=row["hotel"],
+            ssid=row["ssid"],
+            vlan_id=row["vlan_id"],
+        )
+
         raise HTTPException(status_code=410, detail="pending expired")
 
     guest = get_or_create_guest(phone, row["hotel"])
@@ -288,11 +1152,23 @@ def pbx_call(payload: CallIn):
     conn.execute("""
         INSERT INTO call_events (phone, callerid_raw, source_ip, created_at, result)
         VALUES (?, ?, ?, ?, ?)
-    """, (phone, phone, None, now_iso(), "matched_pending"))
+    """, (phone, phone, client_ip, now_iso(), "matched_pending"))
     conn.commit()
     conn.close()
 
     audit("call_verified", phone=phone, mac=row["mac"], ip=row["ip"], nas_id=row["nas_id"], hotel=row["hotel"], ssid=row["ssid"], vlan_id=row["vlan_id"], details=f"Phone verified by PBX call, guest_id={guest['id']}")
+
+    log_phone_event(
+        "PHONE_CALL_VERIFIED",
+        phone,
+        source_ip=client_ip,
+        mac=row["mac"],
+        ip=row["ip"],
+        hotel=row["hotel"],
+        ssid=row["ssid"],
+        vlan_id=row["vlan_id"],
+        guest_id=guest["id"],
+    )
 
     return {
         "status": "verified",
@@ -309,9 +1185,278 @@ def radius_check(payload: RadiusCheckIn):
     ssid = netinfo["ssid_name"]
     vlan_id = netinfo["vlan_id"]
 
+
+    # Voucher-auth flow
+    raw = (payload.username or "").strip()
+
+    if raw.lower().startswith("voucher:"):
+        voucher_code = raw.split(":", 1)[1].strip()
+
+        reply, reason = verify_voucher_radius(
+            code=voucher_code,
+            mac=mac,
+            ip=payload.ip,
+            nas_id=payload.nas_id,
+            hotel=hotel,
+            ssid=ssid,
+            vlan_id=vlan_id,
+        )
+
+        if reply:
+            return reply
+
+        audit(
+            "radius_reject_voucher",
+            phone=raw,
+            mac=mac,
+            ip=payload.ip,
+            nas_id=payload.nas_id,
+            hotel=hotel,
+            ssid=ssid,
+            vlan_id=vlan_id,
+            details=reason
+        )
+        raise HTTPException(status_code=403, detail=reason)
+
+
+    # MAC-auth flow.
+    # MikroTik may send username as MAC before showing login page.
+    raw_as_mac = normalize_mac(raw)
+
+    if raw_as_mac == mac:
+        known = get_recent_authorized_session_by_mac(mac)
+
+        if known:
+            phone_identity = known["guest_phone"]
+
+            session = get_open_session(phone_identity, mac)
+            if session:
+                update_session(session["id"], payload.ip, payload.nas_id, hotel, ssid, vlan_id)
+            else:
+                start_session(
+                    known["guest_id"],
+                    phone_identity,
+                    mac,
+                    payload.ip,
+                    payload.nas_id,
+                    hotel,
+                    ssid,
+                    vlan_id,
+                )
+
+            touch_guest_auth(phone_identity)
+
+            audit(
+                "radius_accept_mac_auth",
+                phone=phone_identity,
+                mac=mac,
+                ip=payload.ip,
+                nas_id=payload.nas_id,
+                hotel=hotel,
+                ssid=ssid,
+                vlan_id=vlan_id,
+                details="Known MAC accepted without portal"
+            )
+            return accept_reply()
+
+        audit(
+            "radius_reject_mac_auth_unknown",
+            phone=None,
+            mac=mac,
+            ip=payload.ip,
+            nas_id=payload.nas_id,
+            hotel=hotel,
+            ssid=ssid,
+            vlan_id=vlan_id,
+            details="MAC not found or auth expired"
+        )
+        raise HTTPException(status_code=403, detail="mac_auth_unknown")
+
+
+    # Dusit room-auth through current RADIUS flow
+    # Room-auth only when username has room|surname format.
+    # Plain phone numbers must continue to the normal call-auth flow below.
+    
+
+    if "|" in raw:
+
+        room_num, surname = [x.strip() for x in raw.split("|", 1)]
+
+        if not room_num or not surname:
+            audit(
+                "radius_reject_room_missing_room_or_surname",
+                phone=raw,
+                mac=mac,
+                ip=payload.ip,
+                nas_id=payload.nas_id,
+                hotel=hotel,
+                ssid=ssid,
+                vlan_id=vlan_id,
+                details="room or surname empty"
+            )
+            raise HTTPException(status_code=403, detail="room_and_surname_required")
+
+        room_identity = make_room_identity(room_num, surname)
+
+        existing_guest = get_active_guest(room_identity)
+        if existing_guest:
+            touch_guest_auth(room_identity)
+
+            session = get_open_session(room_identity, mac)
+            if session:
+                update_session(session["id"], payload.ip, payload.nas_id, hotel, ssid, vlan_id)
+            else:
+                start_session(
+                    existing_guest["id"],
+                    room_identity,
+                    mac,
+                    payload.ip,
+                    payload.nas_id,
+                    hotel,
+                    ssid,
+                    vlan_id,
+                )
+
+                conn = db()
+                conn.execute("""
+                    UPDATE guest_sessions
+                    SET auth_method = 'room',
+                        room_num = ?,
+                        surname = ?
+                    WHERE id = (
+                        SELECT id
+                        FROM guest_sessions
+                        WHERE phone = ? AND mac = ? AND status = 'active'
+                        ORDER BY id DESC
+                        LIMIT 1
+                    )
+                """, (room_num, surname, room_identity, mac))
+                conn.commit()
+                conn.close()
+
+            audit(
+                "radius_accept_existing_room_identity",
+                phone=room_identity,
+                mac=mac,
+                ip=payload.ip,
+                nas_id=payload.nas_id,
+                hotel=hotel,
+                ssid=ssid,
+                vlan_id=vlan_id,
+                details=f"Existing room identity accepted without PMS: room={room_num} surname={surname}"
+            )
+
+            logger.info("ROOM_AUTH_ACCEPT_EXISTING %s", {
+                "room": room_num,
+                "surname": surname,
+                "ip": payload.ip,
+                "hotel": hotel,
+                "source": "existing_guest",
+            })
+
+            return accept_reply()
+
+        pms_result = pms_room_auth_allowed(
+            room_num,
+            surname,
+            hotel=hotel,
+            vlan_id=vlan_id,
+        )
+
+        if pms_result.get("ok"):
+            guest = get_or_create_room_guest(room_num, surname, hotel)
+
+            session = get_open_session(room_identity, mac)
+            if session:
+                update_session(session["id"], payload.ip, payload.nas_id, hotel, ssid, vlan_id)
+            else:
+                start_session(guest["id"], room_identity, mac, payload.ip, payload.nas_id, hotel, ssid, vlan_id)
+
+                conn = db()
+                conn.execute("""
+                    UPDATE guest_sessions
+                    SET auth_method = 'room',
+                        room_num = ?,
+                        surname = ?
+                    WHERE id = (
+                        SELECT id
+                        FROM guest_sessions
+                        WHERE phone = ? AND mac = ? AND status = 'active'
+                        ORDER BY id DESC
+                        LIMIT 1
+                    )
+                """, (room_num, surname, room_identity, mac))
+                conn.commit()
+                conn.close()
+
+            audit(
+                "radius_accept_room_auth",
+                phone=room_identity,
+                mac=mac,
+                ip=payload.ip,
+                nas_id=payload.nas_id,
+                hotel=hotel,
+                ssid=ssid,
+                vlan_id=vlan_id,
+                details=f"room={room_num} surname={surname}"
+            )
+            logger.info("ROOM_AUTH_ACCEPT %s", {
+                "room": room_num,
+                "surname": surname,
+                "ip": payload.ip,
+                "hotel": hotel,
+                "source": pms_result.get("source"),
+                "reservation": pms_result.get("reservation_number", ""),
+            })
+            return accept_reply()
+
+        audit(
+            "radius_reject_room_auth",
+            phone=room_identity,
+            mac=mac,
+            ip=payload.ip,
+            nas_id=payload.nas_id,
+            hotel=hotel,
+            ssid=ssid,
+            vlan_id=vlan_id,
+            details=f"room={room_num} surname={surname}"
+        )
+        
+        logger.info("ROOM_AUTH_REJECT %s", {
+            "room": room_num,
+            "surname": surname,
+            "ip": payload.ip,
+            "hotel": hotel,
+            "source": pms_result.get("source"),
+            "error": pms_result.get("error"),
+        })
+        raise HTTPException(status_code=403, detail="room_auth_not_found")
+
     try:
         phone = normalize_phone(payload.username)
+
+        log_phone_event(
+            "PHONE_RADIUS_CHECK",
+            phone,
+            mac=mac,
+            ip=payload.ip,
+            hotel=hotel,
+            ssid=ssid,
+            vlan_id=vlan_id,
+        )
+
     except ValueError:
+
+        log_phone_event(
+            "PHONE_RADIUS_INVALID",
+            payload.username,
+            mac=mac,
+            ip=payload.ip,
+            hotel=hotel,
+            ssid=ssid,
+            vlan_id=vlan_id,
+        )
+
         audit(
             "radius_reject_invalid_phone",
             phone=payload.username,
@@ -343,6 +1488,16 @@ def radius_check(payload: RadiusCheckIn):
                 vlan_id=vlan_id,
                 details=f"Session id={session['id']}"
             )
+
+            log_phone_event(
+                "PHONE_RADIUS_ACCEPT_EXISTING_SESSION",
+                phone,
+                mac=mac,
+                ip=payload.ip,
+                hotel=hotel,
+                ssid=ssid,
+                vlan_id=vlan_id,
+            )
             return accept_reply()
 
         if active_sessions_count(phone) >= DEVICE_LIMIT:
@@ -357,6 +1512,18 @@ def radius_check(payload: RadiusCheckIn):
                 vlan_id=vlan_id,
                 details=f"Device limit reached: {DEVICE_LIMIT}"
             )
+
+            log_phone_event(
+                "PHONE_RADIUS_REJECT_DEVICE_LIMIT",
+                phone,
+                mac=mac,
+                ip=payload.ip,
+                hotel=hotel,
+                ssid=ssid,
+                vlan_id=vlan_id,
+                limit=DEVICE_LIMIT,
+            )
+
             raise HTTPException(status_code=403, detail="device_limit")
 
         start_session(guest["id"], phone, mac, payload.ip, payload.nas_id, hotel, ssid, vlan_id)
@@ -371,6 +1538,17 @@ def radius_check(payload: RadiusCheckIn):
             vlan_id=vlan_id,
             details=f"Guest id={guest['id']}"
         )
+
+        log_phone_event(
+            "PHONE_RADIUS_ACCEPT_NEW_SESSION",
+            phone,
+            mac=mac,
+            ip=payload.ip,
+            hotel=hotel,
+            ssid=ssid,
+            vlan_id=vlan_id,
+        )
+
         return accept_reply()
 
     pending = get_live_pending(phone, mac)
@@ -404,6 +1582,17 @@ def radius_check(payload: RadiusCheckIn):
                     vlan_id=vlan_id,
                     details="Pending expired"
                 )
+
+                log_phone_event(
+                    "PHONE_RADIUS_REJECT_PENDING_EXPIRED",
+                    phone,
+                    mac=mac,
+                    ip=payload.ip,
+                    hotel=hotel,
+                    ssid=ssid,
+                    vlan_id=vlan_id,
+                )
+
                 raise HTTPException(status_code=403, detail="pending_expired")
 
         audit(
@@ -417,6 +1606,17 @@ def radius_check(payload: RadiusCheckIn):
             vlan_id=vlan_id,
             details="Pending exists, waiting for call"
         )
+
+        log_phone_event(
+            "PHONE_RADIUS_REJECT_WAITING_CALL",
+            phone,
+            mac=mac,
+            ip=payload.ip,
+            hotel=hotel,
+            ssid=ssid,
+            vlan_id=vlan_id,
+        )
+
         raise HTTPException(status_code=403, detail="pending_waiting_call")
 
     expires = now() + timedelta(minutes=PENDING_MINUTES)
@@ -444,7 +1644,46 @@ def radius_check(payload: RadiusCheckIn):
         vlan_id=vlan_id,
         details="Pending created on first radius-check"
     )
+
+    log_phone_event(
+        "PHONE_RADIUS_PENDING_CREATED",
+        phone,
+        mac=mac,
+        ip=payload.ip,
+        hotel=hotel,
+        ssid=ssid,
+        vlan_id=vlan_id,
+        expires_at=expires.isoformat(),
+    )
+    
     raise HTTPException(status_code=403, detail="pending_created")
+
+
+@app.post("/auth/dusit/authorize")
+def auth_dusit_authorize(payload: dict = Body(...)):
+    room_num = (payload.get("room_num") or "").strip()
+    surname = (payload.get("surname") or "").strip()
+    mac = (payload.get("mac") or "").strip()
+    ip = (payload.get("ip") or "").strip()
+    nas_id = (payload.get("nas_id") or "").strip()
+
+    if not room_num or not surname or not mac or not ip:
+        raise HTTPException(status_code=400, detail="room_num_surname_mac_ip_required")
+
+    allowed = room_auth_allowed(room_num, surname)
+    if not allowed:
+        return {"ok": False, "status": "not_found"}
+
+    save_verified_room_auth(
+        room_num=room_num,
+        surname=surname,
+        surname_norm=normalize_user_surname(surname),
+        mac=mac,
+        ip=ip,
+        nas_id=nas_id,
+        hotel="Dusit"
+    )
+    return {"ok": True, "status": "ok"}
 
 
 @app.get("/auth-status")
@@ -456,6 +1695,8 @@ def auth_status(phone: str = Query(...)):
 
     guest = get_active_guest(phone)
     if guest:
+
+        log_phone_event("PHONE_AUTH_STATUS_VERIFIED", phone)
         return {"status": "verified"}
 
     conn = db()
@@ -471,11 +1712,14 @@ def auth_status(phone: str = Query(...)):
             conn.execute("UPDATE pending_auth SET status='expired' WHERE id=?", (pending["id"],))
             conn.commit()
             conn.close()
+
+            log_phone_event("PHONE_AUTH_STATUS_EXPIRED", phone)
             return {"status": "expired"}
         conn.close()
         return {"status": "pending"}
 
     conn.close()
+    log_phone_event("PHONE_AUTH_STATUS_NOT_FOUND", phone)
     return {"status": "not_found"}
 
 
@@ -486,22 +1730,41 @@ def radius_accounting(payload: RadiusAccountingIn):
 
 
 @app.get("/admin", response_class=HTMLResponse)
-def admin_index(request: Request):
-    guard = admin_guard(request)
+def admin_index(request: Request, denied: str = ""):
+    guard = role_guard(request, ("admin", "superadmin", "it"))
     if guard:
         return guard
 
+    username, role = get_current_admin_user(request)
+
+    denied_html = ""
+    if denied:
+        denied_html = """
+        <div class="notice error" style="margin-bottom:14px;">
+          Доступ запрещён. У вашей роли нет прав для открытия этого раздела.
+        </div>
+        """
+
+    disk = get_disk_usage("/")
+    disk_percent = disk["percent"]
+    memory = get_memory_usage()
+    cpu = get_cpu_load()
+    uptime = get_uptime()
+
+    if disk_percent >= 85:
+        disk_class = "error"
+    elif disk_percent >= 70:
+        disk_class = "pending"
+    else:
+        disk_class = "active"
+
     guests_cnt = fetch_all("SELECT COUNT(*) AS cnt FROM guests")[0]["cnt"]
-    sessions_cnt = fetch_all("SELECT COUNT(*) AS cnt FROM guest_sessions WHERE status='active' AND ended_at IS NULL")[0]["cnt"]
+    sessions_cnt = fetch_all("SELECT COUNT(*) AS cnt FROM guest_sessions WHERE status='active' AND ended_at IS NULL AND datetime(last_seen_at) >= datetime('now', '-15 minutes')")[0]["cnt"]
     pending_cnt = fetch_all("SELECT COUNT(*) AS cnt FROM pending_auth WHERE status='pending'")[0]["cnt"]
     calls_cnt = fetch_all("SELECT COUNT(*) AS cnt FROM call_events WHERE date(created_at)=date('now')")[0]["cnt"]
 
-    body = f"""
+    body = denied_html + f"""
     <div class="stats">
-      <div class="stat">
-        <div class="stat-label">Гостей в базе</div>
-        <div class="stat-value" id="stat-guests">{guests_cnt}</div>
-      </div>
       <div class="stat">
         <div class="stat-label">Активных сессий</div>
         <div class="stat-value" id="stat-sessions">{sessions_cnt}</div>
@@ -514,14 +1777,24 @@ def admin_index(request: Request):
         <div class="stat-label">Звонков сегодня</div>
         <div class="stat-value" id="stat-calls">{calls_cnt}</div>
       </div>
+      <div class="stat">
+        <div class="stat-label">По ваучеру сегодня</div>
+        <div class="stat-value" id="stat-auth-voucher">0</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">По комнате сегодня</div>
+        <div class="stat-value" id="stat-auth-room">0</div>
+      </div>
     </div>
 
-    <div class="card" style="margin-top:18px;">
+    <div id="hotspot-sites" class="hotspot-sites"></div>
+
+    <div class="card dashboard-chart-card">
       <h2 style="margin:0 0 12px; font-size:24px;">Активность подключений</h2>
 
       <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:14px; flex-wrap:wrap;">
         <div style="font-size:14px; color:#6b7280;">Период отображения</div>
-        <select id="chartPeriod" style="height:42px; padding:0 12px; border:1px solid #cbd5e1; border-radius:10px; background:#fff;">
+        <select id="chartPeriod">
           <option value="1h">Час</option>
           <option value="1d" selected>День</option>
           <option value="1mo">Месяц</option>
@@ -529,10 +1802,85 @@ def admin_index(request: Request):
         </select>
       </div>
 
-      <div style="width:100%; height:360px;">
+      <div class="chart-controls">
+        <label class="chart-toggle">
+          <input type="checkbox" id="toggle-sessions" checked>
+          <span class="toggle-dot"></span>
+          <span>Активные сессии</span>
+        </label>
+
+        <label class="chart-toggle">
+          <input type="checkbox" id="toggle-auth-total">
+          <span class="toggle-dot"></span>
+          <span>Все авторизации</span>
+        </label>
+
+        <label class="chart-toggle">
+          <input type="checkbox" id="toggle-auth-phone" checked>
+          <span class="toggle-dot"></span>
+          <span>По телефону</span>
+        </label>
+
+        <label class="chart-toggle">
+          <input type="checkbox" id="toggle-auth-voucher" checked>
+          <span class="toggle-dot"></span>
+          <span>По ваучеру</span>
+        </label>
+
+        <label class="chart-toggle">
+          <input type="checkbox" id="toggle-auth-room" checked>
+          <span class="toggle-dot"></span>
+          <span>По комнате</span>
+        </label>
+      </div>
+
+      <div class="chart-box">
         <canvas id="activityChart"></canvas>
       </div>
     </div>
+
+    <div class="system-stats system-stats-compact">
+      <div class="stat">
+        <div class="stat-label">Гостей в базе</div>
+        <div class="stat-value" id="stat-guests">{guests_cnt}</div>
+      </div>
+
+      <div class="stat disk-stat">
+        <div class="stat-label">Диск</div>
+        <div class="stat-row">
+          <div class="stat-value">{disk_percent}%</div>
+          <div class="muted">{disk["used_h"]} / {disk["total_h"]}</div>
+        </div>
+        <div class="disk-bar">
+          <div class="badge {disk_class} disk-fill" style="width:{disk_percent}%;"></div>
+        </div>
+      </div>
+
+      <div class="stat">
+        <div class="stat-label">CPU</div>
+        <div class="stat-row">
+          <div class="stat-value">{cpu["percent"]}%</div>
+          <div class="muted">load {cpu["load1"]} / {cpu["cores"]} cores</div>
+        </div>
+      </div>
+
+      <div class="stat">
+        <div class="stat-label">RAM</div>
+        <div class="stat-row">
+          <div class="stat-value">{memory["percent"]}%</div>
+          <div class="muted">{memory["used_h"]} / {memory["total_h"]}</div>
+        </div>
+      </div>
+
+      <div class="stat">
+        <div class="stat-label">Uptime</div>
+        <div class="stat-row">
+          <div class="stat-value">{uptime["text"]}</div>
+          <div class="muted">сервер работает</div>
+        </div>
+      </div>
+    </div>
+
 
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script>
@@ -550,24 +1898,85 @@ def admin_index(request: Request):
           document.getElementById('stat-sessions').textContent = data.stats.active_sessions;
           document.getElementById('stat-pending').textContent = data.stats.pending;
           document.getElementById('stat-calls').textContent = data.stats.calls_today;
+          document.getElementById('stat-auth-voucher').textContent = data.stats.auth_voucher_today;
+          document.getElementById('stat-auth-room').textContent = data.stats.auth_room_today;
+
+          const sitesBox = document.getElementById('hotspot-sites');
+
+          if (sitesBox && data.hotspot_sites) {{
+            sitesBox.innerHTML = data.hotspot_sites.map((item) => `
+              <div class="hotspot-site-card">
+                <div class="hotspot-site-name">${{item.name}}</div>
+                <div class="hotspot-site-value">${{item.active}}</div>
+                <div class="hotspot-site-label">активных устройств</div>
+              </div>
+            `).join('');
+          }}
 
           const labels = data.chart.labels;
-          const values = data.chart.values;
-
+          
           if (!activityChart) {{
             const ctx = document.getElementById('activityChart').getContext('2d');
             activityChart = new Chart(ctx, {{
               type: 'line',
               data: {{
                 labels: labels,
-                datasets: [{{
-                  label: 'Подключения',
-                  data: values,
-                  tension: 0.35,
-                  fill: true,
-                  borderWidth: 3,
-                  pointRadius: 0
-                }}]
+                datasets: [
+                  {{
+                    label: 'Активные сессии',
+                    data: data.chart.active_sessions,
+                    yAxisID: 'y',
+                    tension: 0.35,
+                    fill: true,
+                    borderWidth: 3,
+                    pointRadius: 0,
+                    hidden: !toggleSessions.checked
+                  }},
+
+                  {{
+                    label: 'Все авторизации',
+                    data: data.chart.auth_total,
+                    yAxisID: 'y1',
+                    tension: 0.35,
+                    fill: false,
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    hidden: !toggleTotal.checked
+                  }},
+
+                  {{
+                    label: 'По телефону',
+                    data: data.chart.auth_call,
+                    yAxisID: 'y1',
+                    tension: 0.35,
+                    fill: false,
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    hidden: !togglePhone.checked
+                  }},
+
+                  {{
+                    label: 'По ваучеру',
+                    data: data.chart.auth_voucher,
+                    yAxisID: 'y1',
+                    tension: 0.35,
+                    fill: false,
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    hidden: !toggleVoucher.checked
+                  }},
+
+                  {{
+                    label: 'По комнате',
+                    data: data.chart.auth_room,
+                    yAxisID: 'y1',
+                    tension: 0.35,
+                    fill: false,
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    hidden: !toggleRoom.checked
+                  }}
+                ]
               }},
               options: {{
                 responsive: true,
@@ -582,22 +1991,64 @@ def admin_index(request: Request):
                 }},
                 scales: {{
                   x: {{
+                    ticks: {{
+                      color: '#111827',
+                      font: {{
+                        size: 12,
+                        weight: '700'
+                      }}
+                    }},
                     grid: {{
-                      display: false
+                      color: 'rgba(17,24,39,.12)'
                     }}
                   }},
                   y: {{
                     beginAtZero: true,
+                    position: 'left',
+  
                     ticks: {{
-                      precision: 0
+                        color: '#111827',
+                        precision: 0,
+                        font: {{
+                          size: 12,
+                          weight: '700'
+                        }}
+                    }},
+
+                    grid: {{
+                        color: 'rgba(17,24,39,.14)'
+                    }}
+                    }},
+
+                  y1: {{
+                    display: true,
+                    beginAtZero: true,
+                    position: 'right',
+
+                    ticks: {{
+                      color: '#111827',
+                      precision: 0,
+                      font: {{
+                        size: 12,
+                        weight: '700'
+                      }}
+                    }},
+
+                    grid: {{
+                      drawOnChartArea: false
                     }}
                   }}
                 }}
               }}
             }});
+          updateChartVisibility();
           }} else {{
             activityChart.data.labels = labels;
-            activityChart.data.datasets[0].data = values;
+            activityChart.data.datasets[0].data = data.chart.active_sessions;
+            activityChart.data.datasets[1].data = data.chart.auth_total;
+            activityChart.data.datasets[2].data = data.chart.auth_call;
+            activityChart.data.datasets[3].data = data.chart.auth_voucher;
+            activityChart.data.datasets[4].data = data.chart.auth_room;            
             activityChart.update();
           }}
         }} catch (e) {{
@@ -605,21 +2056,170 @@ def admin_index(request: Request):
         }}
       }}
 
+      const toggleSessions = document.getElementById('toggle-sessions');
+      const toggleTotal = document.getElementById('toggle-auth-total');
+      const togglePhone = document.getElementById('toggle-auth-phone');
+      const toggleVoucher = document.getElementById('toggle-auth-voucher');
+      const toggleRoom = document.getElementById('toggle-auth-room');
+      const STORAGE_KEY = 'dashboard_chart_toggles';
+
+      function saveToggleState() {{
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({{
+          sessions: toggleSessions.checked,
+          total: toggleTotal.checked,
+          phone: togglePhone.checked,
+          voucher: toggleVoucher.checked,
+          room: toggleRoom.checked
+        }}));
+      }}
+
+      function loadToggleState() {{
+        try {{
+          const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
+
+          if (!saved) return;
+
+          toggleSessions.checked = !!saved.sessions;
+          toggleTotal.checked = !!saved.total;
+          togglePhone.checked = !!saved.phone;
+          toggleVoucher.checked = !!saved.voucher;
+          toggleRoom.checked = !!saved.room;
+
+        }} catch (e) {{
+          console.error('toggle restore failed', e);
+        }}
+      }}
+
+      function updateChartVisibility() {{
+        if (!activityChart) return;
+        activityChart.data.datasets[0].hidden = !toggleSessions.checked;
+        activityChart.data.datasets[1].hidden = !toggleTotal.checked;
+        activityChart.data.datasets[2].hidden = !togglePhone.checked;
+        activityChart.data.datasets[3].hidden = !toggleVoucher.checked;
+        activityChart.data.datasets[4].hidden = !toggleRoom.checked;
+        
+        const showAuthAxis =
+          toggleTotal.checked ||
+          togglePhone.checked ||
+          toggleVoucher.checked ||
+          toggleRoom.checked;
+
+        activityChart.options.scales.y1.display = showAuthAxis;
+
+        activityChart.update();
+      }}
+
+      function syncAuthToggles(changed) {{
+        if (changed === toggleTotal && toggleTotal.checked) {{
+          togglePhone.checked = false;
+          toggleVoucher.checked = false;
+          toggleRoom.checked = false;
+        }}
+
+        if (
+          (changed === togglePhone || changed === toggleVoucher || changed === toggleRoom) &&
+          changed.checked
+        ) {{
+          toggleTotal.checked = false;
+        }}
+
+        const anyEnabled =
+            toggleSessions.checked ||
+            toggleTotal.checked ||
+            togglePhone.checked ||
+            toggleVoucher.checked ||
+            toggleRoom.checked;
+
+          if (!anyEnabled) {{
+            toggleSessions.checked = true;
+          }}
+
+            updateChartVisibility();
+            saveToggleState();
+
+        updateChartVisibility();
+      }}
+
+      [toggleSessions, toggleTotal, togglePhone, toggleVoucher, toggleRoom].forEach((el) => {{
+        if (el) {{
+          el.addEventListener('change', () => syncAuthToggles(el));
+        }}
+      }});
+
       document.getElementById('chartPeriod').addEventListener('change', loadDashboardData);
 
+      
+      loadToggleState();
       loadDashboardData();
       setInterval(loadDashboardData, 30000);
     </script>
     """
-    return admin_page("Панель управления", body, active_tab="home")
+    return admin_page("Панель управления", body, active_tab="home", role=role)
 
 
 @app.get("/admin/guests", response_class=HTMLResponse)
-def admin_guests():
-    rows = fetch_all("SELECT * FROM guests ORDER BY created_at DESC LIMIT 300")
-    cols = ["id", "phone", "first_verified_at", "first_hotel", "auth_method", "status", "created_at", "updated_at"]
-    body = html_table(rows, cols)
-    return admin_page("Гости", body, active_tab="guests")
+def admin_guests(request: Request):
+
+    guard = role_guard(request, ("admin", "superadmin", "it"))
+    if guard:
+        return guard
+
+    username, role = get_current_admin_user(request)
+
+    rows = fetch_all("""
+        SELECT id, phone, auth_type, room_number, guest_name, first_verified_at, first_hotel, auth_method, status, created_at, updated_at
+        FROM guests
+        ORDER BY created_at DESC
+        LIMIT 300
+    """)
+
+    trs = ""
+
+    for row in rows:
+        guest_id = row["id"]
+        if row["auth_type"] == "room":
+            guest_label = f'Комната {row["room_number"] or ""} — {row["guest_name"] or ""}'
+        else:
+            guest_label = str(row["phone"] or "")
+
+        guest_label = escape(guest_label)
+
+        trs += f"""
+        <tr>
+          <td><a href="/admin/client?guest_id={guest_id}">{guest_id}</a></td>
+          <td><a href="/admin/client?guest_id={guest_id}">{guest_label}</a></td>
+          <td>{escape(format_dt(row["first_verified_at"]))}</td>
+          <td>{escape(str(row["first_hotel"] or ""))}</td>
+          <td>{escape(str(row["auth_method"] or ""))}</td>
+          <td>{escape(str(row["status"] or ""))}</td>
+          <td>{escape(format_dt(row["created_at"]))}</td>
+          <td>{escape(format_dt(row["updated_at"]))}</td>
+        </tr>
+        """
+
+    body = f"""
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Клиент</th>
+            <th>Первая проверка</th>
+            <th>Первый объект</th>
+            <th>Метод</th>
+            <th>Статус</th>
+            <th>Создан</th>
+            <th>Обновлён</th>
+          </tr>
+        </thead>
+        <tbody>
+          {trs}
+        </tbody>
+      </table>
+    </div>
+    """
+
+    return admin_page("Гости", body, active_tab="guests", role=role)
 
 
 @app.get("/admin/sessions", response_class=HTMLResponse)
@@ -634,9 +2234,11 @@ def admin_sessions(
     date_from: str = "",
     date_to: str = "",
 ):
-    guard = admin_guard(request)
+    guard = role_guard(request, ("admin", "superadmin", "it"))
     if guard:
         return guard
+
+    username, role = get_current_admin_user(request)
 
     where = []
     params = []
@@ -704,7 +2306,7 @@ def admin_sessions(
         SELECT * FROM guest_sessions
         {where_sql}
         ORDER BY CASE WHEN status='active' THEN 0 ELSE 1 END, started_at DESC
-        LIMIT 500
+        LIMIT 20
         """,
         tuple(params)
     )
@@ -713,16 +2315,18 @@ def admin_sessions(
     linked_rows = []
     for row in rows:
         row_dict = dict(row)
-        if row["phone"]:
-            row_dict["phone"] = (
-                f'<a href="/admin/client?phone={quote(str(row["phone"]))}" '
-                f'style="text-decoration:none;">{escape(str(row["phone"]))}</a>'
-            )
-        if row["mac"]:
-            row_dict["mac"] = (
-                f'<a href="/admin/client?mac={quote(str(row["mac"]))}" '
-                f'style="text-decoration:none;">{escape(str(row["mac"]))}</a>'
-            )
+
+        if row["auth_method"] == "room":
+            client_label = f'Комната {row["room_num"] or ""} — {row["surname"] or ""}'
+        else:
+            client_label = str(row["phone"] or "")
+
+        row_dict["phone"] = client_label
+        row_dict["mac"] = str(row["mac"] or "")
+
+        raw_cause = row["terminate_cause"] or "unknown"
+        row_dict["terminate_cause"] = TERMINATE_CAUSE_LABELS.get(raw_cause, raw_cause)
+
         linked_rows.append(row_dict)
 
 
@@ -786,8 +2390,10 @@ def admin_sessions(
         status_options.append(f'<option value="{value}"{selected}>{label}</option>')
 
     body = f"""
-    <div class="toolbar">
-      <form method="get" action="/admin/sessions" style="display:flex; gap:10px; flex-wrap:wrap; align-items:end;">
+    <div class="system-section">
+      <h2>Фильтр сессий</h2>
+
+      <form class="export-form sessions-export-form" method="get" action="/admin/sessions">
         <div>
           <label style="display:block; margin-bottom:6px; font-weight:600;">Поиск</label>
           <input type="text" name="q" value="{escape(q)}" placeholder="Номер, MAC, IP, session ID">
@@ -795,37 +2401,27 @@ def admin_sessions(
 
         <div>
           <label style="display:block; margin-bottom:6px; font-weight:600;">Статус</label>
-          <select name="status">
-            {''.join(status_options)}
-          </select>
+          <select name="status">{''.join(status_options)}</select>
         </div>
 
         <div>
           <label style="display:block; margin-bottom:6px; font-weight:600;">Объект</label>
-          <select name="hotel">
-            {''.join(hotel_options)}
-          </select>
+          <select name="hotel">{''.join(hotel_options)}</select>
         </div>
 
         <div>
           <label style="display:block; margin-bottom:6px; font-weight:600;">Wi-Fi сеть</label>
-          <select name="ssid">
-            {''.join(ssid_options)}
-          </select>
+          <select name="ssid">{''.join(ssid_options)}</select>
         </div>
 
         <div>
           <label style="display:block; margin-bottom:6px; font-weight:600;">VLAN</label>
-          <select name="vlan_id">
-            {''.join(vlan_options)}
-          </select>
+          <select name="vlan_id">{''.join(vlan_options)}</select>
         </div>
 
         <div>
           <label style="display:block; margin-bottom:6px; font-weight:600;">Причина завершения</label>
-          <select name="terminate_cause">
-            {''.join(cause_options)}
-          </select>
+          <select name="terminate_cause">{''.join(cause_options)}</select>
         </div>
 
         <div>
@@ -838,11 +2434,8 @@ def admin_sessions(
           <input type="date" name="date_to" value="{escape(date_to)}">
         </div>
 
-        <div>
+        <div class="sessions-form-actions">
           <button class="btn primary" type="submit">Применить</button>
-        </div>
-
-        <div>
           <a class="btn" href="/admin/sessions">Сбросить</a>
         </div>
       </form>
@@ -852,12 +2445,15 @@ def admin_sessions(
       Показано сессий: {len(rows)}
     </div>
     """
-
-    body += html_table(
-        rows,
+    
+    table_html = html_table(
+        linked_rows,
         [
             "guest_id",
             "phone",
+            "auth_method",
+            "room_num",
+            "surname",
             "mac",
             "ip",
             "device_name",
@@ -866,6 +2462,7 @@ def admin_sessions(
             "ended_at",
             "status",
             "terminate_cause",
+            "terminate_cause_raw",
             "acct_session_time",
             "hotel",
             "ssid",
@@ -875,38 +2472,824 @@ def admin_sessions(
         ]
     )
 
-    return admin_page("Сессии", body, active_tab="sessions")
+    body += f"""
+    <div class="system-section" style="margin-top:14px; padding:0;">
+      {table_html}
+    </div>
+    """
+
+
+
+    return admin_page("Сессии", body, active_tab="sessions", role=role)
 
 @app.get("/admin/pending", response_class=HTMLResponse)
-def admin_pending():
+def admin_pending(request: Request):
+
+    guard = role_guard(request, ("admin", "superadmin", "it"))
+    if guard:
+        return guard
+
+    username, role = get_current_admin_user(request)
+
     rows = fetch_all("SELECT * FROM pending_auth WHERE status = 'pending' ORDER BY created_at DESC LIMIT 300")
     cols = ["id", "phone", "mac", "ip", "nas_id", "hotel", "ssid", "vlan_id", "created_at", "expires_at", "status"]
     body = html_table(rows, cols)
-    return admin_page("Ожидают подтверждения", body, active_tab="pending")
+    return admin_page("Ожидают подтверждения", body, active_tab="pending", role=role)
 
 
 @app.get("/admin/calls", response_class=HTMLResponse)
-def admin_calls():
+def admin_calls(request: Request):
+
+    guard = role_guard(request, ("admin", "superadmin", "it"))
+    if guard:
+        return guard
+
+    username, role = get_current_admin_user(request)
+
     rows = fetch_all("SELECT * FROM call_events ORDER BY created_at DESC LIMIT 300")
     cols = ["id", "phone", "callerid_raw", "source_ip", "created_at", "result"]
     body = html_table(rows, cols)
-    return admin_page("Звонки", body, active_tab="calls")
+    return admin_page("Звонки", body, active_tab="calls", role=role)
+
+
+@app.get("/admin/vouchers", response_class=HTMLResponse)
+def admin_vouchers(request: Request, error: str = "", ok: str = ""):
+    guard = role_guard(request, ("admin", "superadmin", "it", "reception"))
+    if guard:
+        return guard
+
+    username, role = get_current_admin_user(request)
+
+    msg_html = ""
+
+    errors = {
+        "bad_full_name": "Проверьте ФИО: нужно минимум имя и фамилия, без цифр",
+        "bad_passport": "Паспорт РФ должен быть в формате 4 цифры серии и 6 цифр номера",
+        "bad_foreign_passport": "Загранпаспорт РФ должен содержать 9 цифр",
+        "bad_document_type": "Некорректный тип документа",
+    }
+
+    if error:
+        msg_html = f"""
+        <div class="notice error" style="margin-bottom:14px; text-align:center;">
+          {errors.get(error, "Ошибка при создании ваучера")}
+        </div>
+        """
+
+    rows = fetch_all("""
+        SELECT
+            v.id,
+            v.code_enc,
+            v.status,
+            v.max_devices,
+            COUNT(DISTINCT d.mac) AS used_devices,
+            v.valid_from,
+            v.valid_until,
+            v.site,
+            v.room_num,
+            v.created_by,
+            v.created_at
+        FROM vouchers v
+        LEFT JOIN voucher_devices d ON d.voucher_id = v.id
+        GROUP BY v.id
+        ORDER BY v.id DESC
+        LIMIT 200
+    """)
+
+    voucher_rows = []
+    for row in rows:
+        r = dict(row)
+        r["code"] = decrypt_voucher_code(r.get("code_enc"))
+        voucher_rows.append(r)
+
+    form = """
+    <div class="system-section voucher-create-panel">
+      <h2>Создание ваучера</h2>
+
+      <form class="voucher-form" method="post" action="/admin/vouchers/create">
+
+        <div class="voucher-form-row">
+
+          <div>
+            <label class="required-label">ФИО гостя</label>
+            <input class="required-input"
+                   type="text"
+                   name="full_name"
+                   required
+                   placeholder="Иванов Иван Иванович">
+          </div>
+
+          <div>
+            <label class="required-label">Тип документа</label>
+            <select class="required-input"
+                    name="document_type"
+                    required>
+              <option value="rf_passport">Паспорт РФ</option>
+              <option value="foreign_passport">Загранпаспорт</option>
+            </select>
+          </div>
+
+          <div>
+            <label class="required-label">Серия и номер</label>
+            <input class="required-input"
+                   type="text"
+                   name="passport"
+                   required
+                   placeholder="1234 567890">
+          </div>
+
+          <div>
+            <label>Телефон</label>
+            <input type="text"
+                   name="phone"
+                   placeholder="+7...">
+          </div>
+
+          <div>
+            <label>Дата рождения</label>
+            <input type="date"
+                   name="birth_date">
+          </div>
+
+          <div>
+            <label>Объект</label>
+            <input type="text"
+                   name="site"
+                   placeholder="Dusit">
+          </div>
+
+          <div>
+            <label>Комната</label>
+            <input type="text"
+                   name="room_num"
+                   placeholder="751">
+          </div>
+
+          <div>
+            <label>Устр.</label>
+            <input type="number"
+                   name="max_devices"
+                   value="1"
+                   min="1"
+                   max="3"
+                   required>
+          </div>
+
+          <div>
+            <label>Дней</label>
+            <input type="number"
+                   name="valid_days"
+                   value="1"
+                   min="1"
+                   max="14"
+                   required>
+          </div>
+
+        </div>
+
+        <div class="voucher-submit-row">
+          <button class="btn primary voucher-submit-btn"
+                  type="submit">
+            Создать ваучер
+          </button>
+        </div>
+
+      </form>
+    </div>
+    """
+
+    body = msg_html + form
+
+    body += "<h2 style='margin:18px 0 12px; font-size:22px;'>Последние ваучеры</h2>"
+    
+    table_html = """
+    <div style="overflow-x:auto;">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Код</th>
+            <th>Статус</th>
+            <th>Устройств</th>
+            <th>Использовано</th>
+            <th>Действует с</th>
+            <th>Действует до</th>
+            <th>Объект выдачи</th>
+            <th>Комната</th>
+            <th>Кем создан</th>
+            <th>Создан</th>
+            <th>Действия</th>
+          </tr>
+        </thead>
+        <tbody>
+    """
+
+    def status_badge(status: str) -> str:
+        status = (status or "").strip()
+
+        if status == "active":
+            return '<span class="badge active">Активен</span>'
+
+        if status == "revoked":
+            return '<span class="badge blocked">Отключен</span>'
+
+        if status == "expired":
+            return '<span class="badge expired">Истекла</span>'
+
+        return f'<span class="badge">{escape(status)}</span>'
+
+    for r in voucher_rows:
+        vid = int(r["id"])
+        status = str(r.get("status") or "")
+        disabled = "disabled" if status != "active" else ""
+        button_text = "Отключить" if status == "active" else "Отключен"
+        
+        revoke_cell = ""
+
+        if role == "admin":
+            revoke_cell = f"""
+              <form method="post" action="/admin/vouchers/revoke" style="display:inline-flex; margin:0;" onsubmit="return confirm('Отключить ваучер? Дальнейший вход по нему будет запрещён.');">
+                <input type="hidden" name="voucher_id" value="{vid}">
+                <button class="btn" type="submit" {disabled}>{button_text}</button>
+              </form>
+            """
+
+        table_html += f"""
+          <tr>
+            <td>
+              <a href="/admin/vouchers/{vid}" style="text-decoration:none; font-weight:800;">
+                {vid}
+              </a>
+            </td>
+            <td style="font-weight:800; white-space:nowrap;">
+              <a href="/admin/vouchers/{vid}" style="text-decoration:none;">
+                {escape(str(r.get("code") or "—"))}
+              </a>
+            </td>
+            <td>{status_badge(status)}</td>
+            <td>{escape(str(r.get("max_devices") or ""))}</td>
+            <td>{escape(str(r.get("used_devices") or "0"))}</td>
+            <td>{escape(format_dt(r.get("valid_from")))}</td>
+            <td>{escape(format_dt(r.get("valid_until")))}</td>
+            <td>{escape(str(r.get("site") or ""))}</td>
+            <td>{escape(str(r.get("room_num") or ""))}</td>
+            <td>{escape(str(r.get("created_by") or ""))}</td>
+            <td>{escape(format_dt(r.get("created_at")))}</td>
+            <td>
+              {revoke_cell}
+            </td>
+          </tr>
+        """
+
+    table_html += """
+        </tbody>
+      </table>
+    </div>
+    """
+
+    body += table_html
+    
+    return admin_page("Ваучеры", body, active_tab="vouchers", role=role)
+
+
+@app.post("/admin/vouchers/create", response_class=HTMLResponse)
+def admin_vouchers_create(
+    request: Request,
+    full_name: str = Form(...),
+    passport: str = Form(...),
+    birth_date: str = Form(""),
+    phone: str = Form(""),
+    site: str = Form(""),
+    room_num: str = Form(""),
+    max_devices: int = Form(1),
+    valid_days: int = Form(1),
+    document_type: str = Form(...),
+):
+    guard = role_guard(request, ("admin", "superadmin", "it", "reception"))
+    if guard:
+        return guard
+
+    username, role = get_current_admin_user(request)
+    full_name = full_name.strip()
+    passport_raw = passport.strip()
+    document_type = document_type.strip()
+
+    if not re.match(r"^[А-Яа-яЁёA-Za-z\s-]{5,}$", full_name) or len(full_name.split()) < 2:
+        return RedirectResponse(url="/admin/vouchers?error=bad_full_name", status_code=303)
+
+    passport_digits = re.sub(r"\D", "", passport_raw)
+
+    if document_type == "rf_passport":
+        if not re.match(r"^\d{10}$", passport_digits):
+            return RedirectResponse(url="/admin/vouchers?error=bad_passport", status_code=303)
+
+        passport_normalized = f"Паспорт РФ: {passport_digits[:4]} {passport_digits[4:]}"
+
+    elif document_type == "foreign_passport":
+        if not re.match(r"^\d{9}$", passport_digits):
+            return RedirectResponse(url="/admin/vouchers?error=bad_foreign_passport", status_code=303)
+
+        passport_normalized = f"Загранпаспорт РФ: {passport_digits[:2]} {passport_digits[2:]}"
+
+    else:
+        return RedirectResponse(url="/admin/vouchers?error=bad_document_type", status_code=303)
+
+    max_devices = max(1, min(int(max_devices), 20))
+    valid_days = max(1, min(int(valid_days), 30))
+
+    voucher = create_voucher(
+        full_name=full_name,
+        passport=passport_normalized,
+        birth_date=birth_date.strip(),
+        phone=phone.strip(),
+        site=site.strip(),
+        room_num=room_num.strip(),
+        max_devices=max_devices,
+        valid_days=valid_days,
+        created_by=username,
+    )
+
+    audit(
+        "admin_create_voucher",
+        details=f"user={username}, voucher_id={voucher['id']}, max_devices={max_devices}, valid_days={valid_days}, site={site}, room={room_num}"
+    )
+
+    vid = int(voucher["id"])
+
+    body = f"""
+    <div class="voucher-created-wrap">
+      <div class="card voucher-created-card">
+        <h2>Ваучер создан</h2>
+
+        <div class="voucher-created-code">
+          {escape(voucher["code"])}
+        </div>
+
+        <div class="muted voucher-created-info">
+          Устройств: {max_devices}<br>
+          Действует до: {escape(str(voucher["valid_until"]))}
+        </div>
+
+        <div class="voucher-created-actions">
+          <a class="btn" href="/admin/vouchers">Вернуться к ваучерам</a>
+          <a class="btn primary" href="/admin/vouchers/{vid}/print" target="_blank">Печать</a>
+        </div>
+      </div>
+    </div>
+    """
+
+    return admin_page("Ваучер создан", body, active_tab="vouchers", role=role)
+
+
+@app.get("/admin/vouchers/{voucher_id}", response_class=HTMLResponse)
+def admin_voucher_detail(request: Request, voucher_id: int):
+    guard = role_guard(request, ("admin", "superadmin", "it", "reception"))
+    if guard:
+        return guard
+
+    username, role = get_current_admin_user(request)
+
+    conn = db()
+
+    voucher = conn.execute("""
+        SELECT *
+        FROM vouchers
+        WHERE id = ?
+    """, (voucher_id,)).fetchone()
+
+    if not voucher:
+        audit(
+            "admin_view_voucher_not_found",
+            details=f"user={username}, voucher_id={voucher_id}"
+        )
+        conn.close()
+        return admin_page(
+            "Ваучер",
+            "<div class='muted'>Ваучер не найден.</div>",
+            active_tab="vouchers"
+        )
+
+    devices = conn.execute("""
+        SELECT *
+        FROM voucher_devices
+        WHERE voucher_id = ?
+        ORDER BY last_seen_at DESC
+    """, (voucher_id,)).fetchall()
+
+    conn.close()
+
+    audit(
+        "admin_view_voucher",
+        details=f"user={username}, voucher_id={voucher_id}, site={voucher['site']}, room={voucher['room_num']}, status={voucher['status']}"
+    )
+
+    code = decrypt_voucher_code(voucher["code_enc"])
+
+    status = voucher["status"] or ""
+    if status == "active":
+        status_html = '<span class="badge active">Активна</span>'
+    elif status == "revoked":
+        status_html = '<span class="badge blocked">Отключена</span>'
+    elif status == "expired":
+        status_html = '<span class="badge expired">Истекла</span>'
+    else:
+        status_html = f'<span class="badge">{escape(status)}</span>'
+
+    device_rows = []
+    for d in devices:
+        device_rows.append({
+            "mac": d["mac"],
+            "ip": d["ip"],
+            "first_seen": format_dt(d["first_seen_at"]),
+            "last_seen": format_dt(d["last_seen_at"]),
+            "": f"""
+            <form method="post" action="/admin/vouchers/{voucher_id}/remove-device">
+                <input type="hidden" name="mac" value="{d['mac']}">
+                <button class="btn" style="height:32px;">Освободить</button>
+            </form>
+            """
+        })
+
+
+    revoke_btn = ""
+
+    if role == "superadmin" and status == "active":
+        revoke_btn = f"""
+        <form method="post" action="/admin/vouchers/revoke" style="display:inline-flex; margin:0;"
+              onsubmit="return confirm('Отключить ваучер? Дальнейший вход по нему будет запрещён.');">
+          <input type="hidden" name="voucher_id" value="{voucher_id}">
+          <button class="btn danger" type="submit">
+            Отключить ваучер
+          </button>
+        </form>
+        """
+
+    body = f"""
+    <div class="card" style="margin-bottom:16px;">
+      <h2 style="margin:0 0 14px; font-size:26px;">Ваучер #{voucher_id}</h2>
+
+      <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px;">
+        <div>
+          <div class="muted">Код</div>
+          <div style="font-size:24px; font-weight:900; letter-spacing:.05em;">{escape(code)}</div>
+        </div>
+
+        <div>
+          <div class="muted">Статус</div>
+          <div>{status_html}</div>
+        </div>
+
+        <div>
+          <div class="muted">Устройств</div>
+          <div style="font-weight:700;">{len(devices)} / {escape(str(voucher["max_devices"]))}</div>
+        </div>
+
+        <div>
+          <div class="muted">Действует до</div>
+          <div style="font-weight:700;">{escape(format_dt(voucher["valid_until"]))}</div>
+        </div>
+
+        <div>
+          <div class="muted">Объект выдачи</div>
+          <div style="font-weight:700;">{escape(str(voucher["site"] or "—"))}</div>
+        </div>
+
+        <div>
+          <div class="muted">Комната</div>
+          <div style="font-weight:700;">{escape(str(voucher["room_num"] or "—"))}</div>
+        </div>
+      </div>
+
+      <div style="margin-top:18px; display:flex; gap:12px; flex-wrap:wrap;">
+        <a class="btn voucher-back-btn" href="/admin/vouchers">← Назад к ваучерам</a>
+        <a class="btn primary voucher-print-btn" href="/admin/vouchers/{voucher_id}/print" target="_blank">Печать</a>
+        {revoke_btn}
+      </div>
+
+    <h2 style="margin:18px 0 12px; font-size:22px;">Подключенные устройства</h2>
+    """
+
+    if devices:
+        body += """
+        <div style="overflow-x:auto;">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>MAC-адрес</th>
+                <th>IP-адрес</th>
+                <th>Подключено</th>
+                <th>Последняя активность</th>
+                <th>Действия</th>
+              </tr>
+            </thead>
+            <tbody>
+        """
+
+        for d in devices:
+            mac = str(d["mac"] or "")
+            body += f"""
+              <tr>
+                <td>{escape(mac)}</td>
+                <td>{escape(str(d["ip"] or ""))}</td>
+                <td>{escape(format_dt(d["first_seen_at"]))}</td>
+                <td>{escape(format_dt(d["last_seen_at"]))}</td>
+                <td>
+                  <form method="post" action="/admin/vouchers/{voucher_id}/remove-device" style="margin:0;"
+                        onsubmit="return confirm('Освободить устройство {escape(mac)}?');">
+                    <input type="hidden" name="mac" value="{escape(mac)}">
+                    <button class="btn" type="submit">Освободить</button>
+                  </form>
+                </td>
+              </tr>
+            """
+
+        body += """
+            </tbody>
+          </table>
+        </div>
+        """
+    else:
+        body += "<div class='muted'>По этому ваучеру пока нет подключенных устройств.</div>"
+    
+
+    return admin_page("Ваучер", body, active_tab="vouchers", role=role)
+
+@app.get("/admin/vouchers/{voucher_id}/print", response_class=HTMLResponse)
+def admin_voucher_print(request: Request, voucher_id: int):
+    guard = role_guard(request, ("admin", "superadmin", "it", "reception"))
+    if guard:
+        return guard
+
+    conn = db()
+    voucher = conn.execute("""
+        SELECT *
+        FROM vouchers
+        WHERE id = ?
+    """, (voucher_id,)).fetchone()
+    conn.close()
+
+    if not voucher:
+        return HTMLResponse("Ваучер не найден", status_code=404)
+
+    code = decrypt_voucher_code(voucher["code_enc"])
+
+    username, role = get_current_admin_user(request)
+
+    audit(
+        "admin_print_voucher",
+        details=f"user={username}, voucher_id={voucher_id}, site={voucher['site']}, room={voucher['room_num']}"
+    )
+
+    return HTMLResponse(f"""
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Ваучер {escape(code)}</title>
+  <style>
+    body {{
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #f3f4f6;
+      color: #111827;
+    }}
+
+    .voucher-print {{
+      width: 100mm;
+      min-height: 70mm;
+      margin: 8mm 0 0 8mm;
+      padding: 7mm;
+      border: 1px solid #d1d5db;
+      border-radius: 10px;
+      background: white;
+      box-sizing: border-box;
+    }}
+
+    .brand {{
+      font-size: 20px;
+      font-weight: 800;
+      margin-bottom: 4mm;
+      text-align: center;
+    }}
+
+    .title {{
+      font-size: 13px;
+      text-align: center;
+      margin-bottom: 5mm;
+    }}
+
+    .code {{
+      font-size: 28px;
+      font-weight: 900;
+      letter-spacing: .08em;
+      text-align: center;
+      padding: 5mm;
+      border: 1px dashed #9ca3af;
+      border-radius: 8px;
+      margin-bottom: 5mm;
+    }}
+
+    .row {{
+      font-size: 12px;
+      margin: 2mm 0;
+    }}
+
+    .muted {{
+      font-size: 11px;
+      margin-top: 4mm;
+      color: #6b7280;
+    }}
+
+    .actions {{
+      text-align: center;
+      margin-top: 8mm;
+    }}
+
+    button {{
+      padding: 10px 18px;
+      border: 0;
+      border-radius: 999px;
+      background: #d6b34a;
+      font-weight: 800;
+      cursor: pointer;
+    }}
+
+    @media print {{
+      body {{
+        background: white;
+      }}
+
+      .voucher-print {{
+        width: 100mm;
+        min-height: 70mm;
+        margin: 0;
+        box-shadow: none;
+      }}
+
+      .actions {{
+        display: none;
+      }}
+
+      @page {{
+        size: A4 portrait;
+        margin: 8mm;
+      }}
+    }}
+  </style>
+</head>
+<body>
+  <div class="voucher-print">
+    <div class="brand">MIRACLEON WI-FI</div>
+    <div class="title">Ваучер доступа в интернет</div>
+
+    <div class="code">{escape(code)}</div>
+
+    <div class="row"><b>Действует до:</b> {escape(format_dt(voucher["valid_until"]))}</div>
+    <div class="row"><b>Устройств:</b> {escape(str(voucher["max_devices"]))}</div>
+    <div class="row"><b>Объект:</b> {escape(str(voucher["site"] or "—"))}</div>
+    <div class="row"><b>Комната:</b> {escape(str(voucher["room_num"] or "—"))}</div>
+
+    <div class="row muted" style="margin-top:5mm;">
+      Подключитесь к Wi-Fi MIRACLEON и выберите вход по ваучеру.
+    </div>
+
+    <div class="actions">
+      <button onclick="window.print()">Распечатать</button>
+    </div>
+  </div>
+
+  <script>
+    window.addEventListener("load", () => {{
+      setTimeout(() => window.print(), 300);
+    }});
+  </script>
+</body>
+</html>
+""")
+
+@app.post("/admin/vouchers/revoke")
+def admin_vouchers_revoke(
+    request: Request,
+    voucher_id: int = Form(...),
+):
+    guard = role_guard(request, ("admin", "superadmin"))
+    if guard:
+        return guard
+
+    username, role = get_current_admin_user(request)
+
+    conn = db()
+    row = conn.execute("""
+        SELECT id, status, site, room_num
+        FROM vouchers
+        WHERE id = ?
+    """, (voucher_id,)).fetchone()
+
+    if not row:
+        conn.close()
+        audit(
+            "admin_revoke_voucher_not_found",
+            details=f"user={username}, voucher_id={voucher_id}"
+        )
+        return RedirectResponse(url="/admin/vouchers", status_code=303)
+
+    conn.execute("""
+        UPDATE vouchers
+        SET status = 'revoked',
+            revoked_at = ?,
+            revoke_reason = 'manual_admin'
+        WHERE id = ?
+    """, (now_iso(), voucher_id))
+
+    conn.commit()
+    conn.close()
+
+    audit(
+        "admin_revoke_voucher",
+        details=f"user={username}, voucher_id={voucher_id}, site={row['site']}, room={row['room_num']}, status_before={row['status']}"
+    )
+
+    return RedirectResponse(url="/admin/vouchers", status_code=303)
+
+
+
+@app.post("/admin/vouchers/{voucher_id}/remove-device")
+def admin_voucher_remove_device(
+    request: Request,
+    voucher_id: int,
+    mac: str = Form(...),
+):
+    guard = role_guard(request, ("admin", "superadmin", "it", "reception"))
+    if guard:
+        return guard
+
+    username, role = get_current_admin_user(request)
+    mac = mac.strip()
+
+    conn = db()
+    row = conn.execute("""
+        SELECT id, ip
+        FROM voucher_devices
+        WHERE voucher_id = ? AND mac = ?
+    """, (voucher_id, mac)).fetchone()
+
+    if row:
+        device_ip = row["ip"]
+
+        kicked = 0
+        kick_error = ""
+
+        try:
+            kicked = disconnect_hotspot_active_by_mac(mac)
+        except Exception as e:
+            kick_error = str(e)
+
+        conn.execute("""
+            DELETE FROM voucher_devices
+            WHERE voucher_id = ? AND mac = ?
+        """, (voucher_id, mac))
+        conn.commit()
+
+        audit(
+            "admin_voucher_remove_device",
+            mac=mac,
+            ip=device_ip,
+            details=f"user={username}, voucher_id={voucher_id}, kicked={kicked}, kick_error={kick_error}"
+        )
+
+    conn.close()
+
+    return RedirectResponse(url=f"/admin/vouchers/{voucher_id}", status_code=303)
 
 
 @app.get("/admin/audit", response_class=HTMLResponse)
-def admin_audit():
-    rows = fetch_all("SELECT * FROM audit_log ORDER BY event_time DESC LIMIT 500")
+def admin_audit(request: Request):
+
+    guard = role_guard(request, ("superadmin",))
+    if guard:
+        return guard
+
+    username, role = get_current_admin_user(request)
+
+    rows = fetch_all("SELECT * FROM audit_log ORDER BY event_time DESC LIMIT 20")
     cols = ["id", "phone", "mac", "ip", "nas_id", "hotel", "ssid", "vlan_id", "event_type", "event_time", "details"]
     body = html_table(rows, cols)
-    return admin_page("Аудит", body, active_tab="audit")
+    return admin_page("Аудит", body, active_tab="audit", role=role)
 
 
 @app.get("/admin/networks", response_class=HTMLResponse)
 def admin_networks(request: Request, error: str = "", ok: str = "", edit_id: str = ""):
-    guard = admin_guard(request)
+    guard = role_guard(request, ("superadmin",))
     if guard:
         return guard
 
+    username, role = get_current_admin_user(request)
+
+    body = build_networks_body(error=error, ok=ok, edit_id=edit_id)
+    return admin_page("Сети", body, active_tab="networks")
+
+
+def build_networks_body(error: str = "", ok: str = "", edit_id: str = "", cancel_url: str = "/admin/networks"):
     def r(row, key, default=""):
         value = row[key]
         return default if value is None else value
@@ -929,7 +3312,7 @@ def admin_networks(request: Request, error: str = "", ok: str = "", edit_id: str
 
     add_form = """
     <div class="toolbar" style="margin-bottom:16px;">
-      <form method="post" action="/admin/networks/add" style="display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:12px; width:100%;">
+      <form class="network-form" method="post" action="/admin/networks/add">
         <div>
           <label style="display:block; margin-bottom:6px; font-weight:600;">Объект</label>
           <input type="text" name="hotel_name" placeholder="Например, Корпус А" required>
@@ -1024,7 +3407,7 @@ def admin_networks(request: Request, error: str = "", ok: str = "", edit_id: str
 
             <div style="display:flex; align-items:flex-end; gap:10px;">
               <button class="btn primary" type="submit">Сохранить</button>
-              <a class="btn" href="/admin/networks">Отмена</a>
+              <a class="btn" href="{cancel_url}">Отмена</a>
             </div>
           </form>
         </div>
@@ -1066,23 +3449,17 @@ def admin_networks(request: Request, error: str = "", ok: str = "", edit_id: str
             <td>{escape(str(r(row, "hotspot_server")))}</td>
             <td>{active_text}</td>
             <td>
-              <div style="display:flex; gap:8px; align-items:center; flex-wrap:nowrap;">
-                <a class="btn" href="/admin/networks?edit_id={rid}" style="display:inline-flex; align-items:center; justify-content:center; min-width:112px; height:40px; padding:0 14px; white-space:nowrap; font-size:16px; font-weight:700;">
-                  Изменить
-                </a>
+              <div class="table-actions">
+                <a class="btn table-btn" href="/admin/networks?edit_id={rid}">Изменить</a>
 
                 <form method="post" action="/admin/networks/toggle" style="margin:0;">
                   <input type="hidden" name="network_id" value="{rid}">
-                  <button class="btn" type="submit" style="display:inline-flex; align-items:center; justify-content:center; min-width:112px; height:40px; padding:0 14px; white-space:nowrap; font-size:16px; font-weight:700;">
-                    {toggle_text}
-                  </button>
+                  <button class="btn table-btn" type="submit">{toggle_text}</button>
                 </form>
 
                 <form method="post" action="/admin/networks/delete" style="margin:0;" onsubmit="return confirm('Удалить сеть? Это действие необратимо.');">
                   <input type="hidden" name="network_id" value="{rid}">
-                  <button class="btn" type="submit" style="display:inline-flex; align-items:center; justify-content:center; min-width:112px; height:40px; padding:0 14px; white-space:nowrap; font-size:16px; font-weight:700;">
-                    Удалить
-                  </button>
+                  <button class="btn table-btn" type="submit">Удалить</button>
                 </form>
               </div>
             </td>
@@ -1096,8 +3473,7 @@ def admin_networks(request: Request, error: str = "", ok: str = "", edit_id: str
     """
 
     body = msg_html + add_form + edit_form + table_html
-    return admin_page("Сети", body, active_tab="networks")
-
+    return body        
 
 @app.post("/admin/networks/add")
 def admin_networks_add(
@@ -1110,7 +3486,7 @@ def admin_networks_add(
     hotspot_server: str = Form(""),
     is_active: str = Form("1"),
 ):
-    guard = admin_guard(request)
+    guard = role_guard(request, ("superadmin",))
     if guard:
         return guard
 
@@ -1183,7 +3559,7 @@ def admin_networks_update(
     hotspot_server: str = Form(""),
     is_active: str = Form("1"),
 ):
-    guard = admin_guard(request)
+    guard = role_guard(request, ("superadmin",))
     if guard:
         return guard
 
@@ -1265,7 +3641,7 @@ def admin_networks_toggle(
     request: Request,
     network_id: str = Form(""),
 ):
-    guard = admin_guard(request)
+    guard = role_guard(request, ("superadmin",))
     if guard:
         return guard
 
@@ -1293,7 +3669,7 @@ def admin_networks_delete(
     request: Request,
     network_id: str = Form(""),
 ):
-    guard = admin_guard(request)
+    guard = role_guard(request, ("superadmin",))
     if guard:
         return guard
 
@@ -1350,9 +3726,11 @@ def admin_networks_delete(
 
 @app.get("/admin/find", response_class=HTMLResponse)
 def admin_find(request: Request, q: str = ""):
-    guard = admin_guard(request)
+    guard = role_guard(request, ("admin", "superadmin", "it"))
     if guard:
         return guard
+
+    username, role = get_current_admin_user(request)
 
     form = f"""
     <div class="toolbar">
@@ -1372,7 +3750,8 @@ def admin_find(request: Request, q: str = ""):
         return admin_page(
             "Поиск",
             form + '<div class="muted">Введите номер, MAC, IP или session ID.</div>',
-            active_tab="find"
+            active_tab="find",
+            role=role
         )
 
     raw_q = q.strip()
@@ -1459,6 +3838,7 @@ def admin_find(request: Request, q: str = ""):
                 "ended_at",
                 "status",
                 "terminate_cause",
+                "terminate_cause_raw",
                 "acct_session_time",
                 "hotel",
                 "ssid",
@@ -1488,7 +3868,700 @@ def admin_find(request: Request, q: str = ""):
     else:
         body += "<div class='muted'>Ничего не найдено.</div>"
 
-    return admin_page("Поиск", body, active_tab="find")    
+    return admin_page("Поиск", body, active_tab="find", role=role)    
+
+
+@app.get("/admin/system", response_class=HTMLResponse)
+def admin_system(request: Request, section: str = "export", password_id: str = "", ok: str = ""):
+    guard = role_guard(request, ("superadmin",))
+    if guard:
+        return guard
+
+    username, role = get_current_admin_user(request)
+
+    section = (section or "export").strip()
+
+    tabs = f"""
+    <div class="system-actions">
+      <a class="btn {'primary' if section == 'export' else ''}" href="/admin/system?section=export">Выгрузка</a>
+      <a class="btn {'primary' if section == 'networks' else ''}" href="/admin/system?section=networks">Сети</a>
+      <a class="btn {'primary' if section == 'users' else ''}" href="/admin/system?section=users">Пользователи</a>
+      <a class="btn {'primary' if section == 'settings' else ''}" href="/admin/system?section=settings">Настройки</a>
+      <a class="btn {'primary' if section == 'logs' else ''}" href="/admin/system?section=logs">Логи</a>
+      <a class="btn {'primary' if section == 'service' else ''}" href="/admin/system?section=service">Сервис</a>
+    </div>
+    """
+
+    if section == "export":
+        content = """
+        <div class="system-section">
+          <h2>Выгрузка данных</h2>
+
+          <div class="toolbar">
+            <form class="export-form" method="get" action="/admin/export/download">
+
+              <div>
+                <label style="display:block; margin-bottom:6px; font-weight:600;">Что выгружать</label>
+                <select name="table_name">
+                  <option value="all">Все таблицы</option>
+                  <option value="guests">Гости</option>
+                  <option value="sessions">Сессии</option>
+                  <option value="pending">Pending</option>
+                  <option value="calls">Звонки</option>
+                  <option value="audit">Аудит</option>
+                  <option value="networks">Сети</option>
+                </select>
+              </div>
+
+              <div>
+                <label style="display:block; margin-bottom:6px; font-weight:600;">Формат</label>
+                <select name="fmt">
+                  <option value="zip">ZIP (CSV)</option>
+                  <option value="xlsx">XLSX</option>
+                </select>
+              </div>
+
+              <div>
+                <label style="display:block; margin-bottom:6px; font-weight:600;">Дата с</label>
+                <input type="date" name="date_from">
+              </div>
+
+              <div>
+                <label style="display:block; margin-bottom:6px; font-weight:600;">Дата по</label>
+                <input type="date" name="date_to">
+              </div>
+
+              <div>
+                <button class="btn primary" type="submit">Скачать</button>
+              </div>
+
+            </form>
+          </div>
+
+          <div class="muted">
+            Если выбран формат XLSX, выгружается одна таблица. Для полной выгрузки всех таблиц используйте ZIP.
+          </div>
+        </div>
+        """
+
+    elif section == "networks":
+        content = f"""
+        <div class="system-section">
+          <h2>Сети</h2>
+          {build_networks_body(cancel_url="/admin/system?section=networks")}
+        </div>
+        """
+
+    elif section == "users":
+        users = fetch_all("""
+            SELECT id, username, role, is_active, created_at, updated_at
+            FROM admin_users
+            ORDER BY id
+        """)
+
+        password_form = ""
+
+        if str(password_id).strip().isdigit():
+            pwd_user = fetch_one(
+                "SELECT id, username FROM admin_users WHERE id = ?",
+                (int(password_id),)
+            )
+
+            if pwd_user:
+                password_form = f"""
+                <div class="system-section" style="margin-bottom:16px;">
+                  <h2>Смена пароля: {escape(str(pwd_user["username"]))}</h2>
+
+                  <form class="users-form" method="post" action="/admin/system/users/password">
+                    <input type="hidden" name="user_id" value="{int(pwd_user["id"])}">
+
+                    <div>
+                      <label style="display:block; margin-bottom:6px; font-weight:600;">Новый пароль</label>
+                      <input type="password" name="password" required>
+                    </div>
+
+                    <div>
+                      <button class="btn primary" type="submit">Сохранить пароль</button>
+                    </div>
+
+                    <div>
+                      <a class="btn" href="/admin/system?section=users">Отмена</a>
+                    </div>
+                  </form>
+                </div>
+                """
+
+        rows_html = ""
+
+        for u in users:
+            active_text = "Да" if int(u["is_active"]) == 1 else "Нет"
+            toggle_text = "Отключить" if int(u["is_active"]) == 1 else "Включить"
+            
+            rows_html += f"""
+            <tr>
+              <td>{int(u["id"])}</td>
+              <td>{escape(str(u["username"]))}</td>
+              <td>{escape(str(u["role"]))}</td>
+              <td>{active_text}</td>
+              <td>{escape(format_dt(u["created_at"]))}</td>
+              <td>{escape(format_dt(u["updated_at"]))}</td>
+
+              <td>
+                <div class="table-actions">
+                  <a class="btn table-btn" href="/admin/system?section=users&password_id={int(u["id"])}">Пароль</a>
+
+                  <form method="post" action="/admin/system/users/toggle" style="margin:0;">
+                    <input type="hidden" name="user_id" value="{int(u["id"])}">
+                    <button class="btn table-btn" type="submit">{toggle_text}</button>
+                  </form>
+                  <form method="post" action="/admin/system/users/delete" style="margin:0;" onsubmit="return confirm('Удалить пользователя?');">
+                    <input type="hidden" name="user_id" value="{int(u["id"])}">
+                    <button class="btn table-btn" type="submit">Удалить</button>
+                  </form>
+                </div>
+              </td>
+            </tr>
+            """
+
+        content = f"""
+        <div class="system-section">
+          <h2>Пользователи и роли</h2>
+
+          <form class="users-form" method="post" action="/admin/system/users/add">
+            <div>
+              <label style="display:block; margin-bottom:6px; font-weight:600;">Логин</label>
+              <input type="text" name="username" required>
+            </div>
+
+            <div>
+              <label style="display:block; margin-bottom:6px; font-weight:600;">Пароль</label>
+              <input type="password" name="password" required>
+            </div>
+
+            <div>
+              <label style="display:block; margin-bottom:6px; font-weight:600;">Роль</label>
+              <select name="role">
+                <option value="reception">reception</option>
+                <option value="it">it</option>
+                <option value="superadmin">superadmin</option>
+              </select>
+            </div>
+
+            <div>
+              <button class="btn primary" type="submit">Добавить пользователя</button>
+            </div>
+          </form>
+
+          {password_form}
+
+          <div style="overflow-x:auto;">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Логин</th>
+                  <th>Роль</th>
+                  <th>Активен</th>
+                  <th>Создан</th>
+                  <th>Обновлён</th>
+                  <th>Действия</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows_html}
+              </tbody>
+            </table>
+          </div>
+        </div>
+        """
+
+    elif section == "service":
+        disk = get_disk_usage("/")
+        memory = get_memory_usage()
+        cpu = get_cpu_load()
+        uptime = get_uptime()
+        wal = get_wal_size()
+
+        services = [
+            ("Portal backend", "portal", "hotspot-captive-portal.service"),
+            ("Cleanup worker", "cleanup", "hotspot-cleanup-worker.service"),
+            ("MikroTik sync", "mikrotik", "hotspot-mikrotik-sync-worker.service"),
+            ("Opera FIAS", "opera", "opera-fias-sync.service"),
+            ("FreeRADIUS", "freeradius", "freeradius.service"),
+        ]
+
+        service_rows = "".join(
+            f"""
+            <tr>
+              <td>{escape(title)}</td>
+              <td>{escape(unit)}</td>
+              <td id="svc-status-{key}">{service_badge(systemctl_is_active(unit))}</td>
+            </tr>
+            """
+            for title, key, unit in services
+        )
+
+        content = f"""
+        <div class="system-section">
+          <h2>Сервис</h2>
+
+          <div class="system-stats system-stats-compact">
+            <div class="stat">
+              <div class="stat-label">CPU</div>
+              <div class="stat-row">
+                <div class="stat-value" id="svc-cpu">{cpu["percent"]}%</div>
+                <div class="muted" id="svc-cpu-sub">load {cpu["load1"]} / {cpu["cores"]} cores</div>
+              </div>
+            </div>
+
+            <div class="stat">
+              <div class="stat-label">RAM</div>
+              <div class="stat-row">
+                <div class="stat-value" id="svc-ram">{memory["percent"]}%</div>
+                <div class="muted" id="svc-ram-sub">{memory["used_h"]} / {memory["total_h"]}</div>
+              </div>
+            </div>
+
+            <div class="stat">
+              <div class="stat-label">Disk</div>
+              <div class="stat-row">
+                <div class="stat-value" id="svc-disk">{disk["percent"]}%</div>
+                <div class="muted" id="svc-disk-sub">{disk["used_h"]} / {disk["total_h"]}</div>
+              </div>
+            </div>
+
+            <div class="stat">
+              <div class="stat-label">SQLite WAL</div>
+              <div class="stat-row">
+                <div class="stat-value" id="svc-wal">{wal["text"]}</div>
+                <div class="muted">hotspot.db-wal</div>
+              </div>
+            </div>
+
+            <div class="stat">
+              <div class="stat-label">Uptime</div>
+              <div class="stat-row">
+                <div class="stat-value" id="svc-uptime">{uptime["text"]}</div>
+                <div class="muted">сервер работает</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="table-wrap" style="margin-top:16px;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Компонент</th>
+                  <th>Unit</th>
+                  <th>Статус</th>
+                </tr>
+              </thead>
+              <tbody>
+                {service_rows}
+              </tbody>
+            </table>
+          </div>
+
+          <form method="post" action="/admin/system/service/restart"
+                style="margin-top:16px;"
+                onsubmit="return confirm('Перезапустить backend портала? Панель будет недоступна несколько секунд.');">
+            <button class="btn primary" type="submit">Перезапустить портал</button>
+          </form>
+        </div>
+
+        <script>
+        function serviceBadge(status) {{
+          let cls = "pending";
+          if (status === "active") cls = "active";
+          if (status === "failed") cls = "error";
+          if (status === "inactive") cls = "muted";
+          return '<span class="badge ' + cls + '">' + status + '</span>';
+        }}
+
+        async function refreshServiceStatus() {{
+          try {{
+            const resp = await fetch("/admin/system/service/status-json", {{cache: "no-store"}});
+            if (!resp.ok) return;
+
+            const data = await resp.json();
+            if (!data.ok) return;
+
+            document.getElementById("svc-cpu").textContent = data.cpu.percent + "%";
+            document.getElementById("svc-cpu-sub").textContent = "load " + data.cpu.load1 + " / " + data.cpu.cores + " cores";
+
+            document.getElementById("svc-ram").textContent = data.memory.percent + "%";
+            document.getElementById("svc-ram-sub").textContent = data.memory.used_h + " / " + data.memory.total_h;
+
+            document.getElementById("svc-disk").textContent = data.disk.percent + "%";
+            document.getElementById("svc-disk-sub").textContent = data.disk.used_h + " / " + data.disk.total_h;
+
+            document.getElementById("svc-wal").textContent = data.wal.text;
+            document.getElementById("svc-uptime").textContent = data.uptime.text;
+
+            for (const [key, status] of Object.entries(data.services)) {{
+              const el = document.getElementById("svc-status-" + key);
+              if (el) el.innerHTML = serviceBadge(status);
+            }}
+          }} catch (e) {{}}
+        }}
+
+        setInterval(refreshServiceStatus, 15000);
+        </script>
+        """
+
+    elif section == "settings":
+        content = build_settings_body(ok=ok)
+
+
+    elif section == "logs":
+        unit = request.query_params.get("unit", "portal")
+        lines = request.query_params.get("lines", "100")
+        level = request.query_params.get("level", "all")
+
+        q = request.query_params.get("q", "").strip()
+
+        log_text = read_service_logs(unit, int(lines), level=level, newest_first=False)
+
+        if q:
+            q_lower = q.lower()
+            log_text = "\n".join(
+                line for line in log_text.splitlines()
+                if q_lower in line.lower()
+            )
+                        
+        content = f"""
+        <div class="system-section">
+          <h2>Логи</h2>
+
+          <form method="get" action="/admin/system" class="export-form">
+            <input type="hidden" name="section" value="logs">
+
+            <div>
+              <label style="display:block; margin-bottom:6px; font-weight:600;">Сервис</label>
+              <select name="unit">
+                <option value="portal" {"selected" if unit == "portal" else ""}>Portal</option>
+                <option value="cleanup" {"selected" if unit == "cleanup" else ""}>Cleanup</option>
+                <option value="mikrotik" {"selected" if unit == "mikrotik" else ""}>MikroTik sync</option>
+                <option value="opera" {"selected" if unit == "opera" else ""}>Opera FIAS</option>
+              </select>
+            </div>
+
+            <div>
+              <label style="display:block; margin-bottom:6px; font-weight:600;">Строк</label>
+              <select name="lines">
+                <option value="50" {"selected" if str(lines) == "50" else ""}>50</option>
+                <option value="100" {"selected" if str(lines) == "100" else ""}>100</option>
+                <option value="200" {"selected" if str(lines) == "200" else ""}>200</option>
+                <option value="300" {"selected" if str(lines) == "300" else ""}>300</option>
+              </select>
+            </div>
+
+            <div>
+              <label style="display:block; margin-bottom:6px; font-weight:600;">Фильтр</label>
+              <select name="level">
+                <option value="all" {"selected" if level == "all" else ""}>Все</option>
+                <option value="error" {"selected" if level == "error" else ""}>Ошибки</option>
+              </select>
+            </div>
+
+            <div>
+              <label style="display:block; margin-bottom:6px; font-weight:600;">Поиск</label>
+              <input type="text" name="q" id="log-search" value="{escape(q)}" placeholder="телефон, MAC, IP, PHONE_, vlan">
+            </div>
+
+            <div>
+              <button class="btn primary" type="submit">Открыть</button>
+            </div>
+          </form>
+
+          <div class="muted" style="margin:10px 0 12px;">
+            Старые записи загружены при открытии страницы. Новые строки добавляются ниже в реальном времени.
+          </div>
+
+          <pre id="live-log-box" style="white-space:pre-wrap; word-break:break-word; background:#111827; color:#e5e7eb; padding:14px; border-radius:12px; overflow:auto; max-height:650px;">{escape(log_text)}</pre>
+        </div>
+
+        <script>
+        (function () {{
+          const box = document.getElementById("live-log-box");
+          const unit = "{escape(unit)}";
+          const level = "{escape(level)}";
+          const query = "{escape(q)}".toLowerCase();
+
+          const url = "/admin/system/logs-stream?unit=" + encodeURIComponent(unit) + "&level=" + encodeURIComponent(level);
+
+          const es = new EventSource(url);
+
+          function appendLine(line) {{
+            if (!box) return;
+
+            if (query) {{
+              const lowLine = line.toLowerCase();
+              if (!lowLine.includes(query)) return;
+            }}
+
+            const nearBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 40;
+            box.textContent += "\\n" + line;
+
+            const maxChars = 120000;
+            if (box.textContent.length > maxChars) {{
+              box.textContent = box.textContent.slice(-maxChars);
+            }}
+
+            if (nearBottom) {{
+              box.scrollTop = box.scrollHeight;
+            }}
+          }}
+
+          es.onmessage = function (event) {{
+            appendLine(event.data);
+          }};
+
+          es.onerror = function () {{
+            appendLine("[live-log] соединение потеряно, браузер попробует переподключиться...");
+          }};
+
+          if (box) {{
+            box.scrollTop = box.scrollHeight;
+          }}
+        }})();
+        </script>
+        """
+
+    else:
+        return RedirectResponse(url="/admin/system?section=export", status_code=303)
+
+    body = tabs + content
+
+    return admin_page("Система", body, active_tab="system")
+    
+
+@app.get("/admin/system/logs-stream")
+def admin_system_logs_stream(request: Request, unit: str = "portal", level: str = "all"):
+    guard = role_guard(request, ("superadmin", "it"))
+    if guard:
+        return guard
+
+    service = resolve_log_service(unit)
+    level = (level or "all").strip().lower()
+
+    def should_emit(line: str) -> bool:
+        if level != "error":
+            return True
+
+        low = line.lower()
+        return (
+            "error" in low
+            or "exception" in low
+            or "traceback" in low
+            or "failed" in low
+        )
+
+    def stream():
+        cmd = ["journalctl", "-u", service, "-f", "-n", "0", "--no-pager", "-l"]
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        yield f"data: [live-log] connected to {service}\n\n"
+
+        try:
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    if proc.poll() is not None:
+                        yield f"data: [live-log] journalctl stopped with code {proc.returncode}\n\n"
+                        break
+                    continue
+
+                line = line.rstrip("\n")
+                if not should_emit(line):
+                    continue
+
+                line = line.replace("\r", "")
+                yield f"data: {line}\n\n"
+
+        finally:
+            proc.terminate()
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/admin/system/users/add")
+def admin_system_users_add(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+    role: str = Form(...),
+):
+    guard = role_guard(request, ("superadmin",))
+    if guard:
+        return guard
+
+    username = username.strip()
+    role = role.strip()
+
+    if role not in ("superadmin", "it", "reception"):
+        return RedirectResponse(url="/admin/system?section=users&error=bad_role", status_code=303)
+
+    if not username or not password:
+        return RedirectResponse(url="/admin/system?section=users&error=empty", status_code=303)
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    try:
+        conn = db()
+        conn.execute("""
+            INSERT INTO admin_users (
+                username, password_hash, role, is_active, created_at, updated_at
+            )
+            VALUES (?, ?, ?, 1, ?, ?)
+        """, (
+            username,
+            hash_admin_password(password),
+            role,
+            now,
+            now
+        ))
+        conn.commit()
+        conn.close()
+    except Exception:
+        return RedirectResponse(url="/admin/system?section=users&error=exists", status_code=303)
+
+    return RedirectResponse(url="/admin/system?section=users&ok=created", status_code=303)
+
+
+@app.post("/admin/system/users/toggle")
+def admin_system_users_toggle(
+    request: Request,
+    user_id: int = Form(...)
+):
+    guard = role_guard(request, ("superadmin",))
+    if guard:
+        return guard
+
+    user = fetch_one(
+        "SELECT * FROM admin_users WHERE id = ?",
+        (user_id,)
+    )
+
+    if not user:
+        return RedirectResponse(
+            url="/admin/system?section=users",
+            status_code=303
+        )
+
+    new_state = 0 if int(user["is_active"]) == 1 else 1
+
+    conn = db()
+    conn.execute("""
+        UPDATE admin_users
+        SET is_active = ?, updated_at = ?
+        WHERE id = ?
+    """, (
+        new_state,
+        datetime.now(timezone.utc).isoformat(),
+        user_id
+    ))
+    conn.commit()
+    conn.close()
+
+
+@app.post("/admin/system/users/delete")
+def admin_system_users_delete(
+    request: Request,
+    user_id: int = Form(...)
+):
+    guard = role_guard(request, ("superadmin",))
+    if guard:
+        return guard
+
+    current_username, current_role = get_current_admin_user(request)
+
+    user = fetch_one(
+        "SELECT id, username, role, is_active FROM admin_users WHERE id = ?",
+        (user_id,)
+    )
+
+    if not user:
+        return RedirectResponse(url="/admin/system?section=users", status_code=303)
+
+    if str(user["username"]) == str(current_username):
+        return RedirectResponse(url="/admin/system?section=users&error=self_delete", status_code=303)
+
+    if str(user["role"]) == "superadmin":
+        cnt = fetch_one("""
+            SELECT COUNT(*) AS cnt
+            FROM admin_users
+            WHERE role = 'superadmin'
+              AND is_active = 1
+        """)["cnt"]
+
+        if int(cnt) <= 1:
+            return RedirectResponse(url="/admin/system?section=users&error=last_superadmin", status_code=303)
+
+    conn = db()
+    conn.execute(
+        "DELETE FROM admin_users WHERE id = ?",
+        (user_id,)
+    )
+    conn.commit()
+    conn.close()
+
+
+    return RedirectResponse(url="/admin/system?section=users&ok=deleted", status_code=303)
+
+
+@app.post("/admin/system/users/password")
+def admin_system_users_password(
+    request: Request,
+    user_id: int = Form(...),
+    password: str = Form(...)
+):
+    guard = role_guard(request, ("superadmin",))
+    if guard:
+        return guard
+
+    password = password.strip()
+
+    if len(password) < 6:
+        return RedirectResponse(url=f"/admin/system?section=users&password_id={user_id}&error=short_password", status_code=303)
+
+    user = fetch_one(
+        "SELECT id FROM admin_users WHERE id = ?",
+        (user_id,)
+    )
+
+    if not user:
+        return RedirectResponse(url="/admin/system?section=users&error=user_not_found", status_code=303)
+
+    conn = db()
+    conn.execute("""
+        UPDATE admin_users
+        SET password_hash = ?, updated_at = ?
+        WHERE id = ?
+    """, (
+        hash_admin_password(password),
+        datetime.now(timezone.utc).isoformat(),
+        user_id
+    ))
+    conn.commit()
+    conn.close()
+
+    return RedirectResponse(url="/admin/system?section=users&ok=password_changed", status_code=303)
+
 
 @app.get("/admin/export/xlsx/{table_name}")
 def admin_export_xlsx(
@@ -1497,9 +4570,11 @@ def admin_export_xlsx(
     date_from: str | None = None,
     date_to: str | None = None
 ):
-    guard = admin_guard(request)
+    guard = role_guard(request, ("superadmin",))
     if guard:
         return guard
+
+    username, role = get_current_admin_user(request)
 
     data = build_single_xlsx(table_name, date_from=date_from, date_to=date_to)
     filename = f"{table_name}_{date_from or 'all'}_{date_to or 'all'}.xlsx"
@@ -1512,16 +4587,18 @@ def admin_export_xlsx(
 
 @app.get("/admin/export", response_class=HTMLResponse)
 def admin_export_page(request: Request):
-    guard = admin_guard(request)
+    guard = role_guard(request, ("superadmin",))
     if guard:
         return guard
 
+    username, role = get_current_admin_user(request)
+
     body = """
     <div class="toolbar">
-      <form method="get" action="/admin/export/download" style="display:flex; flex-wrap:wrap; gap:12px; align-items:end;">
+      <form class="export-form" method="get" action="/admin/export/download">
         <div>
           <label style="display:block; margin-bottom:6px; font-weight:600;">Что выгружать</label>
-          <select name="table_name" style="height:42px; padding:0 12px; border:1px solid #cbd5e1; border-radius:10px; background:#fff; min-width:220px;">
+          <select name="table_name">
             <option value="all">Все таблицы</option>
             <option value="guests">Гости</option>
             <option value="sessions">Сессии</option>
@@ -1534,7 +4611,7 @@ def admin_export_page(request: Request):
 
         <div>
           <label style="display:block; margin-bottom:6px; font-weight:600;">Формат</label>
-          <select name="fmt" style="height:42px; padding:0 12px; border:1px solid #cbd5e1; border-radius:10px; background:#fff; min-width:160px;">
+          <select name="fmt">
             <option value="zip">ZIP (CSV)</option>
             <option value="xlsx">XLSX</option>
           </select>
@@ -1571,9 +4648,11 @@ def admin_export_download(
     date_from: str | None = None,
     date_to: str | None = None
 ):
-    guard = admin_guard(request)
+    guard = role_guard(request, ("superadmin",))
     if guard:
         return guard
+
+    username, role = get_current_admin_user(request)
 
     if fmt == "zip":
         data = build_export_zip(date_from=date_from, date_to=date_to)
@@ -1601,19 +4680,59 @@ def admin_export_download(
 
 @app.get("/admin/dashboard-data")
 def admin_dashboard_data(request: Request, period: str = "1d"):
-    guard = admin_guard(request)
+    guard = role_guard(request, ("admin", "superadmin", "it"))
     if guard:
         return guard
 
+    username, role = get_current_admin_user(request)
+
     guests_cnt = fetch_all("SELECT COUNT(*) AS cnt FROM guests")[0]["cnt"]
-    sessions_cnt = fetch_all("SELECT COUNT(*) AS cnt FROM guest_sessions WHERE status='active' AND ended_at IS NULL")[0]["cnt"]
+    sessions_cnt = fetch_all("SELECT COUNT(*) AS cnt FROM guest_sessions WHERE status='active' AND ended_at IS NULL AND datetime(last_seen_at) >= datetime('now', '-15 minutes')")[0]["cnt"]
     pending_cnt = fetch_all("SELECT COUNT(*) AS cnt FROM pending_auth WHERE status='pending'")[0]["cnt"]
-    calls_today = fetch_all("SELECT COUNT(*) AS cnt FROM call_events WHERE date(created_at)=date('now')")[0]["cnt"]
+
+    auth_call_today = fetch_all("""
+        SELECT COUNT(*) AS cnt
+        FROM audit_log
+        WHERE event_type = 'call_verified'
+          AND date(datetime(event_time, '+3 hours')) = date(datetime('now', '+3 hours'))
+    """)[0]["cnt"]
+
+    auth_voucher_today = fetch_all("""
+        SELECT COUNT(*) AS cnt
+        FROM audit_log
+        WHERE event_type = 'radius_accept_voucher'
+          AND date(datetime(event_time, '+3 hours')) = date(datetime('now', '+3 hours'))
+    """)[0]["cnt"]
+
+    auth_room_today = fetch_all("""
+        SELECT COUNT(*) AS cnt
+        FROM (
+            SELECT hotel, room_num, lower(trim(surname)) AS surname_norm
+            FROM guest_sessions
+            WHERE auth_method = 'room'
+              AND date(datetime(started_at, '+3 hours')) = date(datetime('now', '+3 hours'))
+              AND room_num IS NOT NULL
+              AND room_num != ''
+              AND surname IS NOT NULL
+              AND surname != ''
+            GROUP BY hotel, room_num, lower(trim(surname))
+        ) x
+    """)[0]["cnt"]
 
     now_local = datetime.now(DISPLAY_TZ)
 
-    labels = []
-    values = []
+    def parse_dt(value):
+        if not value:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(value))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(DISPLAY_TZ)
+        except Exception:
+            return None
+
+    buckets = []
 
     if period == "1h":
         current = now_local.replace(second=0, microsecond=0)
@@ -1621,101 +4740,32 @@ def admin_dashboard_data(request: Request, period: str = "1d"):
         end = current.replace(minute=minute_floor)
         start = end - timedelta(minutes=55)
 
-        bucket_map = OrderedDict()
         for i in range(12):
-            dt = start + timedelta(minutes=i * 5)
-            key = dt.strftime("%Y-%m-%d %H:%M")
-            bucket_map[key] = 0
-
-        rows = fetch_all("""
-            SELECT started_at
-            FROM guest_sessions
-            WHERE datetime(started_at) >= datetime('now', '-1 hour')
-        """)
-
-        for row in rows:
-            try:
-                dt = datetime.fromisoformat(row["started_at"])
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                dt = dt.astimezone(DISPLAY_TZ).replace(second=0, microsecond=0)
-                minute_floor = dt.minute - (dt.minute % 5)
-                dt = dt.replace(minute=minute_floor)
-                key = dt.strftime("%Y-%m-%d %H:%M")
-                if key in bucket_map:
-                    bucket_map[key] += 1
-            except Exception:
-                continue
-
-        labels = [datetime.strptime(k, "%Y-%m-%d %H:%M").strftime("%H:%M") for k in bucket_map.keys()]
-        values = list(bucket_map.values())
-
-    elif period == "1d":
-        start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-
-        bucket_map = OrderedDict()
-        for h in range(24):
-            dt = start + timedelta(hours=h)
-            key = dt.strftime("%Y-%m-%d %H")
-            bucket_map[key] = 0
-
-        rows = fetch_all("""
-            SELECT started_at
-            FROM guest_sessions
-            WHERE date(datetime(started_at, '+3 hours')) = date(datetime('now', '+3 hours'))
-        """)
-
-        for row in rows:
-            try:
-                dt = datetime.fromisoformat(row["started_at"])
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                dt = dt.astimezone(DISPLAY_TZ).replace(minute=0, second=0, microsecond=0)
-                key = dt.strftime("%Y-%m-%d %H")
-                if key in bucket_map:
-                    bucket_map[key] += 1
-            except Exception:
-                continue
-
-        labels = [f"{h:02d}:00" for h in range(24)]
-        values = list(bucket_map.values())
+            b_start = start + timedelta(minutes=i * 5)
+            b_end = b_start + timedelta(minutes=5)
+            buckets.append({
+                "label": b_start.strftime("%H:%M"),
+                "start": b_start,
+                "end": b_end,
+            })
 
     elif period == "1mo":
         start_day = now_local.date() - timedelta(days=29)
-
-        bucket_map = OrderedDict()
         for i in range(30):
             d = start_day + timedelta(days=i)
-            key = d.strftime("%Y-%m-%d")
-            bucket_map[key] = 0
-
-        rows = fetch_all("""
-            SELECT started_at
-            FROM guest_sessions
-            WHERE datetime(started_at) >= datetime('now', '-30 days')
-        """)
-
-        for row in rows:
-            try:
-                dt = datetime.fromisoformat(row["started_at"])
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                dt = dt.astimezone(DISPLAY_TZ).date()
-                key = dt.strftime("%Y-%m-%d")
-                if key in bucket_map:
-                    bucket_map[key] += 1
-            except Exception:
-                continue
-
-        labels = [datetime.strptime(k, "%Y-%m-%d").strftime("%d.%m") for k in bucket_map.keys()]
-        values = list(bucket_map.values())
+            b_start = datetime(d.year, d.month, d.day, tzinfo=DISPLAY_TZ)
+            b_end = b_start + timedelta(days=1)
+            buckets.append({
+                "label": b_start.strftime("%d.%m"),
+                "start": b_start,
+                "end": b_end,
+            })
 
     elif period == "1y":
-        bucket_map = OrderedDict()
         year = now_local.year
         month = now_local.month
-
         months = []
+
         for i in range(11, -1, -1):
             y = year
             m = month - i
@@ -1725,72 +4775,206 @@ def admin_dashboard_data(request: Request, period: str = "1d"):
             months.append((y, m))
 
         for y, m in months:
-            key = f"{y:04d}-{m:02d}"
-            bucket_map[key] = 0
+            b_start = datetime(y, m, 1, tzinfo=DISPLAY_TZ)
+            if m == 12:
+                b_end = datetime(y + 1, 1, 1, tzinfo=DISPLAY_TZ)
+            else:
+                b_end = datetime(y, m + 1, 1, tzinfo=DISPLAY_TZ)
 
-        rows = fetch_all("""
-            SELECT started_at
-            FROM guest_sessions
-            WHERE datetime(started_at) >= datetime('now', '-1 year')
-        """)
-
-        for row in rows:
-            try:
-                dt = datetime.fromisoformat(row["started_at"])
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                dt = dt.astimezone(DISPLAY_TZ)
-                key = dt.strftime("%Y-%m")
-                if key in bucket_map:
-                    bucket_map[key] += 1
-            except Exception:
-                continue
-
-        labels = [datetime.strptime(k, "%Y-%m").strftime("%m.%Y") for k in bucket_map.keys()]
-        values = list(bucket_map.values())
+            buckets.append({
+                "label": b_start.strftime("%m.%Y"),
+                "start": b_start,
+                "end": b_end,
+            })
 
     else:
         period = "1d"
         start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
 
-        bucket_map = OrderedDict()
         for h in range(24):
-            dt = start + timedelta(hours=h)
-            key = dt.strftime("%Y-%m-%d %H")
-            bucket_map[key] = 0
+            b_start = start + timedelta(hours=h)
+            b_end = b_start + timedelta(hours=1)
+            buckets.append({
+                "label": f"{h:02d}:00",
+                "start": b_start,
+                "end": b_end,
+            })
 
-        rows = fetch_all("""
-            SELECT started_at
-            FROM guest_sessions
-            WHERE date(datetime(started_at, '+3 hours')) = date(datetime('now', '+3 hours'))
-        """)
+    labels = [b["label"] for b in buckets]
 
-        for row in rows:
-            try:
-                dt = datetime.fromisoformat(row["started_at"])
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                dt = dt.astimezone(DISPLAY_TZ).replace(minute=0, second=0, microsecond=0)
-                key = dt.strftime("%Y-%m-%d %H")
-                if key in bucket_map:
-                    bucket_map[key] += 1
-            except Exception:
-                continue
+    active_sessions = [0 for _ in buckets]
+    auth_call = [0 for _ in buckets]
+    auth_voucher = [0 for _ in buckets]
+    auth_room = [0 for _ in buckets]
 
-        labels = [f"{h:02d}:00" for h in range(24)]
-        values = list(bucket_map.values())
+    range_start = buckets[0]["start"]
+    range_end = buckets[-1]["end"]
+
+    session_rows = fetch_all("""
+        SELECT started_at, ended_at, last_seen_at, status
+        FROM guest_sessions
+        WHERE started_at IS NOT NULL
+          AND (
+            ended_at IS NOT NULL
+            OR status = 'active'
+          )
+    """)
+
+    for row in session_rows:
+        started = parse_dt(row["started_at"])
+        ended = parse_dt(row["ended_at"])
+
+        if not started:
+            continue
+
+        if not ended and row["status"] != "active":
+            ended = parse_dt(row["last_seen_at"])
+
+        if not ended and row["status"] != "active":
+            continue
+
+        if started >= range_end:
+            continue
+
+        if ended and ended <= range_start:
+            continue
+
+        for idx, b in enumerate(buckets):
+            if started < b["end"] and (ended is None or ended > b["start"]):
+                active_sessions[idx] += 1
+
+    event_rows = fetch_all("""
+    SELECT event_type, event_time
+    FROM audit_log
+    WHERE event_type IN (
+        'call_verified',
+        'radius_accept_voucher'
+    )
+    """)
+
+    for row in event_rows:
+        event_time = parse_dt(row["event_time"])
+        if not event_time:
+            continue
+
+        if event_time < range_start or event_time >= range_end:
+            continue
+
+        for idx, b in enumerate(buckets):
+            if b["start"] <= event_time < b["end"]:
+                if row["event_type"] == "call_verified":
+                    auth_call[idx] += 1
+                elif row["event_type"] == "radius_accept_voucher":
+                    auth_voucher[idx] += 1
+                break
+
+    room_rows = fetch_all("""
+        SELECT started_at, hotel, room_num, surname
+        FROM guest_sessions
+        WHERE auth_method = 'room'
+          AND started_at IS NOT NULL
+          AND room_num IS NOT NULL
+          AND room_num != ''
+          AND surname IS NOT NULL
+          AND surname != ''
+    """)
+
+    room_seen = [set() for _ in buckets]
+
+    for row in room_rows:
+        started = parse_dt(row["started_at"])
+
+        if not started:
+            continue
+
+        if started < range_start or started >= range_end:
+            continue
+
+        guest_key = (
+            (row["hotel"] or "").strip().lower(),
+            (row["room_num"] or "").strip().lower(),
+            (row["surname"] or "").strip().lower(),
+        )
+
+        for idx, b in enumerate(buckets):
+            if b["start"] <= started < b["end"]:
+                room_seen[idx].add(guest_key)
+                break
+
+    auth_room = [len(s) for s in room_seen]
+
+    for row in event_rows:
+        event_time = parse_dt(row["event_time"])
+        if not event_time:
+            continue
+
+        if event_time < range_start or event_time >= range_end:
+            continue
+
+        for idx, b in enumerate(buckets):
+            if b["start"] <= event_time < b["end"]:
+                if row["event_type"] == "call_verified":
+                    auth_call[idx] += 1
+                elif row["event_type"] == "radius_accept_voucher":
+                    auth_voucher[idx] += 1
+                elif row["event_type"] == "radius_accept_room_auth":
+                    auth_room[idx] += 1
+                break
+
+    auth_total = [
+        auth_call[i] + auth_voucher[i] + auth_room[i]
+        for i in range(len(buckets))
+    ]
+
+    hotspot_sites = []
+
+    try:
+        hotspot_rows = fetch_hotspot_active()
+
+        server_labels = {
+            "great_hall": "Great Hall",
+            "fioleto": "FioLeto",
+            "gorod_mira": "Gorod Mira",
+            "movenpick": "Movenpick",
+            "funf": "Funf",
+            "dusit": "Dusit",
+        }
+
+        site_counts = {}
+
+        for row in hotspot_rows:
+            server = row.get("server") or "unknown"
+            label = server_labels.get(server, server)
+            site_counts[label] = site_counts.get(label, 0) + 1
+
+        hotspot_sites = [
+            {"name": name, "active": active}
+            for name, active in sorted(site_counts.items())
+        ]
+
+    except Exception as e:
+        logger.warning("hotspot active fetch failed: %s", e)
+        hotspot_sites = []
 
     return {
         "stats": {
             "guests": guests_cnt,
             "active_sessions": sessions_cnt,
             "pending": pending_cnt,
-            "calls_today": calls_today
+            "calls_today": auth_call_today,
+            "auth_call_today": auth_call_today,
+            "auth_voucher_today": auth_voucher_today,
+            "auth_room_today": auth_room_today,
         },
+        "hotspot_sites": hotspot_sites,
         "chart": {
             "labels": labels,
-            "values": values,
-            "period": period
+            "active_sessions": active_sessions,
+            "auth_total": auth_total,
+            "auth_call": auth_call,
+            "auth_voucher": auth_voucher,
+            "auth_room": auth_room,
+            "period": period,
         }
     }
 
@@ -1800,13 +4984,27 @@ def admin_client(
     request: Request,
     phone: str = "",
     mac: str = "",
+    guest_id: int = 0,
 ):
-    guard = admin_guard(request)
+    guard = role_guard(request, ("admin", "superadmin", "it"))
     if guard:
         return guard
 
+    username, role = get_current_admin_user(request)
+
     phone = phone.strip()
     mac = mac.strip().lower()
+
+    guest = None
+
+    if guest_id:
+        guest_rows = fetch_all(
+            "SELECT * FROM guests WHERE id = ? LIMIT 1",
+            (guest_id,)
+        )
+        if guest_rows:
+            guest = guest_rows[0]
+            phone = str(guest["phone"] or "").strip()
 
     normalized_phone = None
 
@@ -1816,7 +5014,7 @@ def admin_client(
         except Exception:
             normalized_phone = phone
 
-    if not phone and not mac:
+    if not phone and not mac and not guest_id:
         return admin_page(
             "Карточка клиента",
             '<div class="muted">Не указан номер телефона или MAC-адрес.</div>',
@@ -1826,13 +5024,17 @@ def admin_client(
     where = []
     params = []
 
-    if normalized_phone:
-        where.append("phone = ?")
-        params.append(normalized_phone)
+    if guest_id:
+        where.append("guest_id = ?")
+        params.append(guest_id)
+    else:
+        if normalized_phone:
+            where.append("phone = ?")
+            params.append(normalized_phone)
 
-    if mac:
-        where.append("LOWER(mac) = ?")
-        params.append(mac)
+        if mac:
+            where.append("LOWER(mac) = ?")
+            params.append(mac)
 
     where_sql = " OR ".join(where)
 
@@ -1842,7 +5044,7 @@ def admin_client(
         FROM guest_sessions
         WHERE {where_sql}
         ORDER BY started_at DESC
-        LIMIT 500
+        LIMIT 20
         """,
         tuple(params)
     )
@@ -1855,7 +5057,12 @@ def admin_client(
         )
 
     first = sessions[0]
-    client_phone = phone or (first["phone"] or "")
+
+    if first["auth_method"] == "room":
+        client_label = f'Комната {first["room_num"] or ""} — {first["surname"] or ""}'
+    else:
+        client_label = phone or (first["phone"] or "")
+
     client_mac = mac or (first["mac"] or "")
 
     unique_macs = sorted({(row["mac"] or "").strip() for row in sessions if (row["mac"] or "").strip()})
@@ -1887,8 +5094,8 @@ def admin_client(
     summary_html = f"""
     <div class="toolbar" style="margin-bottom:16px; display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:12px;">
       <div class="card" style="padding:14px;">
-        <div class="muted">Телефон</div>
-        <div style="font-size:18px; font-weight:700;">{escape(client_phone or '—')}</div>
+        <div class="muted">Клиент</div>
+        <div style="font-size:18px; font-weight:700;">{escape(client_label or '—')}</div>
       </div>
       <div class="card" style="padding:14px;">
         <div class="muted">Активных сессий</div>
@@ -1925,10 +5132,21 @@ def admin_client(
     """
 
     
+    linked_sessions = []
+    for row in sessions:
+        row_dict = dict(row)
+
+        if row["auth_method"] == "room":
+            row_dict["phone"] = f'Комната {row["room_num"] or ""} — {row["surname"] or ""}'
+        else:
+            row_dict["phone"] = str(row["phone"] or "")
+
+        linked_sessions.append(row_dict)
+
 
     body = summary_html
     body += html_table(
-        sessions,
+        linked_sessions,
         [
             "guest_id",
             "phone",
@@ -1940,6 +5158,7 @@ def admin_client(
             "ended_at",
             "status",
             "terminate_cause",
+            "terminate_cause_raw",
             "acct_session_time",
             "hotel",
             "ssid",
@@ -1949,11 +5168,101 @@ def admin_client(
         ]
     )
 
-    return admin_page("Карточка клиента", body, active_tab="sessions")
+    return admin_page("Карточка клиента", body, active_tab="sessions", role=role)
 
 
-@app.post("/internal/run-cleanup")
-def internal_run_cleanup(x_internal_token: Optional[str] = Header(default=None)):
-    if x_internal_token != APP_SECRET:
-        raise HTTPException(status_code=403, detail="forbidden")
-    return run_cleanup()
+@app.post("/auth/dusit/room")
+def auth_dusit_room(payload: dict = Body(...)):
+    room_num = (payload.get("room_num") or "").strip()
+    surname = (payload.get("surname") or "").strip()
+
+    if not room_num or not surname:
+        raise HTTPException(status_code=400, detail="room_num_and_surname_required")
+    allowed = room_auth_allowed(room_num, surname)
+
+    if not allowed:
+        return {
+            "ok": False,
+            "status": "not_found"
+        }
+
+    return {
+        "ok": True,
+        "status": "ok"
+    }
+
+
+@app.post("/admin/system/service/restart")
+def admin_service_restart(request: Request):
+    guard = role_guard(request, ("superadmin",))
+    if guard:
+        return guard
+
+    subprocess.Popen(
+        ["/usr/bin/sudo", "/usr/local/sbin/hotspot-portal-restart"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    return HTMLResponse("""
+    <!doctype html>
+    <html lang="ru">
+    <head>
+      <meta charset="utf-8">
+      <meta http-equiv="refresh" content="5;url=/admin/system?section=service">
+      <link rel="stylesheet" href="/static/admin.css">
+      <title>Перезапуск</title>
+    </head>
+    <body class="login-page">
+      <div class="login-wrap">
+        <div class="login-card">
+          <div class="login-brand">MIRACLEON WI-FI</div>
+          <h1>Портал перезапускается</h1>
+          <div class="login-subtitle">Через несколько секунд страница обновится.</div>
+        </div>
+      </div>
+    </body>
+    </html>
+    """)
+
+
+def resolve_log_service(unit: str) -> str:
+    allowed_units = {
+        "portal": "hotspot-captive-portal.service",
+        "cleanup": "hotspot-cleanup-worker.service",
+        "mikrotik": "hotspot-mikrotik-sync-worker.service",
+        "opera": "opera-fias-sync.service",
+    }
+    return allowed_units.get(unit, allowed_units["portal"])
+
+def read_service_logs(unit: str, lines: int = 100, level: str = "all", newest_first: bool = True) -> str:
+    service = resolve_log_service(unit)
+    lines = max(20, min(int(lines or 100), 300))
+    level = (level or "all").strip().lower()
+
+    try:
+        r = subprocess.run(
+            ["journalctl", "-u", service, "-n", str(lines), "--no-pager", "-l"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        log_text = r.stdout or r.stderr or ""
+    except Exception as e:
+        return f"Ошибка чтения логов: {e}"
+
+    log_lines = log_text.splitlines()
+
+    if level == "error":
+        log_lines = [
+            line for line in log_lines
+            if "error" in line.lower()
+            or "exception" in line.lower()
+            or "traceback" in line.lower()
+            or "failed" in line.lower()
+        ]
+
+    if newest_first:
+        log_lines.reverse()
+
+    return "\n".join(log_lines)

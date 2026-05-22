@@ -1,0 +1,13 @@
+[Unit]
+Description=Hotspot Cleanup Worker
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/hotspot-captive-portal
+EnvironmentFile=/opt/hotspot-captive-portal/.env
+ExecStart=/opt/hotspot-captive-portal/.venv/bin/python /opt/hotspot-captive-portal/workers/cleanup_worker.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,15 +1,68 @@
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 import ipaddress
-import threading
-import time
 import json
+import time
+import threading
+import logging
 
 from db import db
 from auth import now, now_iso, normalize_phone, normalize_mac
 
 DISPLAY_TZ = ZoneInfo("Europe/Moscow")
 
+logger = logging.getLogger(__name__)
+
+
+TERMINATE_CAUSE_ALIASES = {
+    "user-request": "user_request",
+    "user request": "user_request",
+    "lost-service": "lost_service",
+    "lost service": "lost_service",
+    "lost-carrier": "lost_carrier",
+    "lost carrier": "lost_carrier",
+    "admin-reset": "admin_reset",
+    "admin reset": "admin_reset",
+    "session-timeout": "session_timeout",
+    "session timeout": "session_timeout",
+    "idle-timeout": "idle_timeout",
+    "idle timeout": "idle_timeout",
+    "nas-request": "nas_request",
+    "nas request": "nas_request",
+    "nas-reboot": "nas_reboot",
+    "nas reboot": "nas_reboot",
+    "legacy-cleanup": "cleanup_legacy",
+    "retest-cleanup": "cleanup_retest",
+    "cleanup": "cleanup",
+    "duplicate-session": "duplicate_session",
+    "duplicate session": "duplicate_session",
+    "interim-timeout": "interim_timeout",
+    "interim timeout": "interim_timeout",
+    "stale-active-cleanup": "stale_active_cleanup",
+    "stale active cleanup": "stale_active_cleanup",
+    "stale-session-cleanup": "stale_session_cleanup",
+    "stale session cleanup": "stale_session_cleanup",
+    "duplicate-active-cleanup": "duplicate_active_cleanup",
+    "duplicate active cleanup": "duplicate_active_cleanup",
+    "manual-room-test-cleanup": "manual_room_test_cleanup",
+    "manual room test cleanup": "manual_room_test_cleanup",
+    "stale_session_cleanup": "stale_session_cleanup",
+    "stale_active_cleanup": "stale_active_cleanup",
+    "duplicate_active_cleanup": "duplicate_active_cleanup",
+    "manual_room_test_cleanup": "manual_room_test_cleanup",
+}
+
+
+def normalize_terminate_cause(value: str | None) -> str | None:
+    if value is None:
+        return None
+
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    key = raw.lower().replace("_", "-")
+    return TERMINATE_CAUSE_ALIASES.get(key, "unknown")
 
 
 def normalize_accounting_event_time(value: str | None) -> str:
@@ -77,6 +130,19 @@ def resolve_network_info(ip: str | None):
 
 
 def audit(event_type: str, phone=None, mac=None, ip=None, nas_id=None, hotel=None, ssid=None, vlan_id=None, details=None):
+    logger.info(
+        "AUDIT event_type=%s phone=%s mac=%s ip=%s nas_id=%s hotel=%s ssid=%s vlan_id=%s details=%s",
+        event_type,
+        phone or "-",
+        mac or "-",
+        ip or "-",
+        nas_id or "-",
+        hotel or "-",
+        ssid or "-",
+        vlan_id or "-",
+        details or "-",
+    )
+
     conn = db()
     conn.execute("""
         INSERT INTO audit_log (phone, mac, ip, nas_id, hotel, ssid, vlan_id, event_type, event_time, details)
@@ -92,6 +158,35 @@ def save_radius_accounting(evt):
     event_time = normalize_accounting_event_time(evt.event_time)
     mac = normalize_mac(evt.mac) if evt.mac else None
 
+    if evt.acct_status_type == "Interim-Update":
+        if evt.acct_session_id:
+            conn.execute("""
+                UPDATE guest_sessions
+                SET last_seen_at = ?,
+                    ip = COALESCE(?, ip),
+                    nas_id = COALESCE(?, nas_id),
+                    acct_session_time = COALESCE(?, acct_session_time)
+                WHERE acct_session_id = ?
+                  AND status = 'active'
+                  AND ended_at IS NULL
+                  AND (
+                        last_seen_at IS NULL
+                     OR datetime(last_seen_at) <= datetime(?, '-120 seconds')
+                  )
+            """, (
+                event_time,
+                evt.ip,
+                evt.nas_id,
+                evt.session_time,
+                evt.acct_session_id,
+                event_time,
+            ))
+
+        conn.commit()
+        conn.close()
+        return
+
+
     conn.execute("""
         INSERT INTO radius_accounting
         (
@@ -105,12 +200,13 @@ def save_radius_accounting(evt):
             called_station_id,
             acct_status_type,
             terminate_cause,
+            terminate_cause_raw,
             session_time,
             event_time,
             raw_json,
             created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         evt.acct_session_id,
         evt.username,
@@ -121,6 +217,7 @@ def save_radius_accounting(evt):
         evt.nas_port_id,
         evt.called_station_id,
         evt.acct_status_type,
+        normalize_terminate_cause(evt.terminate_cause),
         evt.terminate_cause,
         evt.session_time,
         event_time,
@@ -152,10 +249,8 @@ def save_radius_accounting(evt):
                 FROM guest_sessions
                 WHERE status = 'active'
                   AND ended_at IS NULL
-                  AND acct_session_id IS NULL
                   AND phone = ?
                   AND mac = ?
-                  AND started_at >= datetime('now', '-10 minutes')
                 ORDER BY id DESC
                 LIMIT 1
             """, (phone, mac)).fetchone()
@@ -166,9 +261,7 @@ def save_radius_accounting(evt):
                 FROM guest_sessions
                 WHERE status = 'active'
                   AND ended_at IS NULL
-                  AND acct_session_id IS NULL
                   AND mac = ?
-                  AND started_at >= datetime('now', '-10 minutes')
                 ORDER BY id DESC
                 LIMIT 1
             """, (mac,)).fetchone()
@@ -183,6 +276,8 @@ def save_radius_accounting(evt):
                     acct_session_id = COALESCE(?, acct_session_id),
                     last_seen_at = ?,
                     status = 'active',
+                    ended_at = NULL,
+                    terminate_cause = NULL,
                     acct_session_time = COALESCE(?, acct_session_time)
                 WHERE id = ?
             """, (
@@ -239,22 +334,6 @@ def save_radius_accounting(evt):
                 evt.session_time or 0
             ))
 
-    elif evt.acct_status_type == "Interim-Update":
-        if evt.acct_session_id:
-            conn.execute("""
-                UPDATE guest_sessions
-                SET last_seen_at = ?,
-                    ip = COALESCE(?, ip),
-                    nas_id = COALESCE(?, nas_id),
-                    acct_session_time = COALESCE(?, acct_session_time)
-                WHERE acct_session_id = ?
-            """, (
-                event_time,
-                evt.ip,
-                evt.nas_id,
-                evt.session_time,
-                evt.acct_session_id
-            ))
 
     elif evt.acct_status_type == "Stop":
         updated = 0
@@ -265,11 +344,13 @@ def save_radius_accounting(evt):
                     last_seen_at = ?,
                     status = 'closed',
                     terminate_cause = ?,
+                    terminate_cause_raw = ?,
                     acct_session_time = COALESCE(?, acct_session_time)
                 WHERE acct_session_id = ? AND status = 'active'
             """, (
                 event_time,
                 event_time,
+                normalize_terminate_cause(evt.terminate_cause),
                 evt.terminate_cause,
                 evt.session_time,
                 evt.acct_session_id
@@ -283,11 +364,13 @@ def save_radius_accounting(evt):
                     last_seen_at = ?,
                     status = 'closed',
                     terminate_cause = ?,
+                    terminate_cause_raw = ?,
                     acct_session_time = COALESCE(?, acct_session_time)
                 WHERE mac = ? AND status = 'active'
             """, (
                 event_time,
                 event_time,
+                normalize_terminate_cause(evt.terminate_cause),
                 evt.terminate_cause,
                 evt.session_time,
                 mac
@@ -304,9 +387,13 @@ _cleanup_worker_lock = threading.Lock()
 def _cleanup_worker_loop(interval_seconds: int = 60):
     while True:
         try:
-            run_cleanup()
-        except Exception as e:
-            print(f"[cleanup] worker iteration failed: {e}")
+            result = run_cleanup()
+
+            if any(result.values()):
+                logger.info("cleanup result: %s", result)           
+
+        except Exception:
+            logger.exception("cleanup worker iteration failed")
         time.sleep(interval_seconds)
 
 
@@ -385,33 +472,37 @@ def cleanup_stale_sessions():
     closed = 0
 
     rows = conn.execute("""
-        SELECT id, started_at
+        SELECT id, started_at, last_seen_at
         FROM guest_sessions
         WHERE status = 'active'
           AND ended_at IS NULL
-          AND acct_session_id IS NULL
     """).fetchall()
 
     to_close = []
 
     for row in rows:
+        raw_ts = row["last_seen_at"] or row["started_at"]
+
         try:
-            started = datetime.fromisoformat(row["started_at"])
+            last_seen = datetime.fromisoformat(raw_ts)
         except Exception:
             continue
 
-        if started.tzinfo is None:
-            started = started.replace(tzinfo=timezone.utc)
+        if last_seen.tzinfo is None:
+            last_seen = last_seen.replace(tzinfo=timezone.utc)
 
-        if current - started > timedelta(minutes=30):
-            to_close.append(row["id"])
+        if current - last_seen > timedelta(hours=6):
+            ended_at = last_seen.isoformat()
+            to_close.append((ended_at, row["id"]))
 
     if to_close:
         conn.executemany("""
             UPDATE guest_sessions
-            SET ended_at = ?, status = 'closed', terminate_cause = 'Legacy-Cleanup'
+            SET ended_at = ?,
+                status = 'closed',
+                terminate_cause = 'stale_session_cleanup'
             WHERE id = ?
-        """, [(now_iso(), x) for x in to_close])
+        """, to_close)
         conn.commit()
         closed = len(to_close)
 
@@ -450,17 +541,5 @@ def accept_reply():
         "Mikrotik-Group": "guest_default",
         "Session-Timeout": "259200"
     }
-
-
-
-
-
-
-
-
-
-
-
-
 
 

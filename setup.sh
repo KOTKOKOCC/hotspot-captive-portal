@@ -12,11 +12,6 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! command -v curl >/dev/null 2>&1; then
-  echo "curl not found. Install curl first."
-  exit 1
-fi
-
 prompt_with_default() {
   local prompt="$1"
   local default="$2"
@@ -38,24 +33,6 @@ prompt_secret_with_default() {
     value="$default"
   fi
   printf '%s' "$value"
-}
-
-install_cleanup_cron() {
-  local app_port="$1"
-  local app_secret="$2"
-
-  local cron_line="*/10 * * * * curl -fsS -X POST http://127.0.0.1:${app_port}/internal/run-cleanup -H \"X-Internal-Token: ${app_secret}\" >> /var/log/hotspot-cleanup.log 2>&1"
-
-  local current_cron
-  current_cron="$(crontab -l 2>/dev/null || true)"
-  current_cron="$(printf '%s\n' "$current_cron" | grep -v '/internal/run-cleanup' || true)"
-
-  {
-    printf '%s\n' "$current_cron"
-    printf '%s\n' "$cron_line"
-  } | crontab -
-
-  echo "Cleanup cron job installed."
 }
 
 echo "[1/4] Preparing virtual environment"
@@ -87,29 +64,17 @@ APP_SECRET_VAL=$(prompt_secret_with_default "App secret" "change_me")
 ADMIN_USERNAME_VAL=$(prompt_with_default "Admin username" "admin")
 ADMIN_PASSWORD_VAL=$(prompt_secret_with_default "Admin password" "change_me")
 ADMIN_COOKIE_VAL=$(prompt_with_default "Admin cookie name" "hotspot_admin")
+VOUCHER_SECRET_KEY_VAL=$(python3 - <<'PY'
+import secrets
+print(secrets.token_hex(32))
+PY
+)
 
 DEVICE_LIMIT_VAL=$(prompt_with_default "Device limit per phone" "3")
 PENDING_MINUTES_VAL=$(prompt_with_default "Pending auth timeout (minutes)" "10")
-DEVICE_SYNC_INTERVAL_VAL=$(prompt_with_default "MikroTik sync interval (seconds)" "300")
 
-MT_HOST_VAL=$(prompt_with_default "MikroTik host" "192.168.88.1")
-MT_PORT_VAL=$(prompt_with_default "MikroTik API port" "8728")
 
-if ! [[ "$MT_PORT_VAL" =~ ^[0-9]+$ ]]; then
-  echo "ERROR: MikroTik API port must be a number."
-  exit 1
-fi
 
-MT_USER_VAL=$(prompt_with_default "MikroTik API user" "api-read")
-MT_PASS_VAL=$(prompt_secret_with_default "MikroTik API password" "change_me")
-
-APP_PORT_VAL=$(prompt_with_default "Application port" "8000")
-if ! [[ "$APP_PORT_VAL" =~ ^[0-9]+$ ]]; then
-  echo "ERROR: Application port must be a number."
-  exit 1
-fi
-
-INSTALL_CLEANUP_CRON_VAL=$(prompt_with_default "Install cleanup cron job" "yes")
 
 escape_env() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
@@ -126,36 +91,54 @@ rm -f .env
   echo "ADMIN_PASSWORD=\"$(escape_env "$ADMIN_PASSWORD_VAL")\""
   echo "ADMIN_COOKIE=\"$(escape_env "$ADMIN_COOKIE_VAL")\""
 
+  echo "VOUCHER_SECRET_KEY=\"$(escape_env "$VOUCHER_SECRET_KEY_VAL")\""
+
   echo "DEVICE_LIMIT=\"$(escape_env "$DEVICE_LIMIT_VAL")\""
   echo "PENDING_MINUTES=\"$(escape_env "$PENDING_MINUTES_VAL")\""
-  echo "DEVICE_SYNC_INTERVAL=\"$(escape_env "$DEVICE_SYNC_INTERVAL_VAL")\""
 
-  echo "MT_HOST=\"$(escape_env "$MT_HOST_VAL")\""
-  echo "MT_PORT=\"$(escape_env "$MT_PORT_VAL")\""
-  echo "MT_USER=\"$(escape_env "$MT_USER_VAL")\""
-  echo "MT_PASS=\"$(escape_env "$MT_PASS_VAL")\""
-  echo "APP_PORT=\"$(escape_env "$APP_PORT_VAL")\""
 } > .env
 
-if [[ "$INSTALL_CLEANUP_CRON_VAL" == "yes" || "$INSTALL_CLEANUP_CRON_VAL" == "y" || "$INSTALL_CLEANUP_CRON_VAL" == "да" ]]; then
-  install_cleanup_cron "$APP_PORT_VAL" "$APP_SECRET_VAL"
-fi
-
-mkdir -p backups docs deploy
+mkdir -p backups docs deploy workers
 
 echo
-echo "[4/4] Setup complete"
-echo ".env created successfully."
-echo
+echo "[4/4] Installing systemd services"
 
-read -r -p "Start backend now? [y/N]: " START_NOW
-START_NOW="$(printf '%s' "$START_NOW" | tr '[:upper:]' '[:lower:]')"
-
-if [[ "$START_NOW" == "y" || "$START_NOW" == "yes" || "$START_NOW" == "да" ]]; then
-  exec python -m uvicorn app:app --host 0.0.0.0 --port "$APP_PORT_VAL"
+if [ "$(id -u)" -ne 0 ]; then
+  echo "Skipping systemd install: run setup.sh as root to install services."
+  echo
+  echo "Setup complete without systemd services."
+  echo "To run manually:"
+  echo "  source .venv/bin/activate"
+  echo "  python -m uvicorn app:app --host 0.0.0.0 --port 8080"
+  exit 0
 fi
 
-echo "Done."
-echo "To start later:"
-echo "  source .venv/bin/activate"
-echo "  python -m uvicorn app:app --host 0.0.0.0 --port $APP_PORT_VAL"
+install_service() {
+  local src="$1"
+  local dst="$2"
+
+  if [ ! -f "$src" ]; then
+    echo "Missing service file: $src"
+    exit 1
+  fi
+
+  cp "$src" "$dst"
+  chmod 644 "$dst"
+  echo "Installed $dst"
+}
+
+install_service "deploy/hotspot-captive-portal.service" "/etc/systemd/system/hotspot-captive-portal.service"
+install_service "deploy/hotspot-cleanup-worker.service" "/etc/systemd/system/hotspot-cleanup-worker.service"
+install_service "deploy/hotspot-mikrotik-sync-worker.service" "/etc/systemd/system/hotspot-mikrotik-sync-worker.service"
+
+systemctl daemon-reload
+
+systemctl enable --now hotspot-captive-portal.service
+systemctl enable --now hotspot-cleanup-worker.service
+systemctl enable --now hotspot-mikrotik-sync-worker.service
+
+echo
+echo "Setup complete."
+echo
+echo "Services:"
+systemctl --no-pager --type=service --state=running | grep -E "hotspot-captive-portal|hotspot-cleanup-worker|hotspot-mikrotik-sync-worker" || true

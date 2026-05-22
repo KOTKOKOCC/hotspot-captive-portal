@@ -11,10 +11,16 @@ def db():
 
     conn = sqlite3.connect(
         str(db_path),
-        timeout=10,
+        timeout=30,
         check_same_thread=False,
     )
     conn.row_factory = sqlite3.Row
+
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA foreign_keys=ON")
+
     return conn
 
 
@@ -84,6 +90,7 @@ def init_db():
         expires_at TEXT,
         status TEXT NOT NULL DEFAULT 'active',
         terminate_cause TEXT,
+        terminate_cause_raw TEXT,
         acct_session_time INTEGER,
         device_name TEXT,
         FOREIGN KEY (guest_id) REFERENCES guests(id)
@@ -130,6 +137,7 @@ def init_db():
         called_station_id TEXT,
         acct_status_type TEXT,
         terminate_cause TEXT,
+        terminate_cause_raw TEXT,
         session_time INTEGER,
         event_time TEXT NOT NULL,
         raw_json TEXT,
@@ -170,8 +178,8 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_ip ON audit_log(ip)")
 
     cur.execute("CREATE INDEX IF NOT EXISTS idx_radius_accounting_session_id ON radius_accounting(acct_session_id)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_radius_accounting_username ON radius_accounting(username)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_radius_accounting_mac ON radius_accounting(mac)")
+    #cur.execute("CREATE INDEX IF NOT EXISTS idx_radius_accounting_username ON radius_accounting(username)")
+    #cur.execute("CREATE INDEX IF NOT EXISTS idx_radius_accounting_mac ON radius_accounting(mac)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_radius_accounting_event_time ON radius_accounting(event_time)")
 
     conn.commit()
@@ -195,6 +203,23 @@ def ensure_guests_last_auth_at():
     conn.close()
 
 
+def ensure_guests_auth_columns():
+    conn = db()
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(guests)").fetchall()]
+
+    if "auth_type" not in cols:
+        conn.execute("ALTER TABLE guests ADD COLUMN auth_type TEXT DEFAULT 'phone'")
+
+    if "room_number" not in cols:
+        conn.execute("ALTER TABLE guests ADD COLUMN room_number TEXT")
+
+    if "guest_name" not in cols:
+        conn.execute("ALTER TABLE guests ADD COLUMN guest_name TEXT")
+
+    conn.commit()
+    conn.close()
+
+
 def ensure_guest_sessions_device_name():
     conn = db()
     cols = conn.execute("PRAGMA table_info(guest_sessions)").fetchall()
@@ -204,4 +229,97 @@ def ensure_guest_sessions_device_name():
         conn.execute("ALTER TABLE guest_sessions ADD COLUMN device_name TEXT")
         conn.commit()
 
+    conn.close()
+
+
+def _normalize_existing_terminate_cause(value):
+    if value is None:
+        return None
+
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    aliases = {
+        "user-request": "user_request",
+        "user request": "user_request",
+        "lost-service": "lost_service",
+        "lost service": "lost_service",
+        "lost-carrier": "lost_carrier",
+        "lost carrier": "lost_carrier",
+        "admin-reset": "admin_reset",
+        "admin reset": "admin_reset",
+        "session-timeout": "session_timeout",
+        "session timeout": "session_timeout",
+        "idle-timeout": "idle_timeout",
+        "idle timeout": "idle_timeout",
+        "nas-request": "nas_request",
+        "nas request": "nas_request",
+        "nas-reboot": "nas_reboot",
+        "nas reboot": "nas_reboot",
+        "legacy-cleanup": "cleanup_legacy",
+        "retest-cleanup": "cleanup_retest",
+        "cleanup": "cleanup",
+    }
+
+    key = raw.lower().replace("_", "-")
+    return aliases.get(key, raw if raw in set(aliases.values()) else "unknown")
+
+
+def ensure_terminate_cause_columns():
+    conn = db()
+
+    session_cols = {r["name"] for r in conn.execute("PRAGMA table_info(guest_sessions)").fetchall()}
+    if "terminate_cause_raw" not in session_cols:
+        conn.execute("ALTER TABLE guest_sessions ADD COLUMN terminate_cause_raw TEXT")
+        conn.execute("""
+            UPDATE guest_sessions
+            SET terminate_cause_raw = terminate_cause
+            WHERE terminate_cause IS NOT NULL AND terminate_cause != ''
+        """)
+
+    radius_cols = {r["name"] for r in conn.execute("PRAGMA table_info(radius_accounting)").fetchall()}
+    if "terminate_cause_raw" not in radius_cols:
+        conn.execute("ALTER TABLE radius_accounting ADD COLUMN terminate_cause_raw TEXT")
+        conn.execute("""
+            UPDATE radius_accounting
+            SET terminate_cause_raw = terminate_cause
+            WHERE terminate_cause IS NOT NULL AND terminate_cause != ''
+        """)
+
+    for table in ("guest_sessions", "radius_accounting"):
+        rows = conn.execute(f"""
+            SELECT id, terminate_cause
+            FROM {table}
+            WHERE terminate_cause IS NOT NULL AND terminate_cause != ''
+        """).fetchall()
+
+        for row in rows:
+            normalized = _normalize_existing_terminate_cause(row["terminate_cause"])
+            if normalized != row["terminate_cause"]:
+                conn.execute(
+                    f"UPDATE {table} SET terminate_cause = ? WHERE id = ?",
+                    (normalized, row["id"]),
+                )
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_guest_sessions_terminate_cause ON guest_sessions(terminate_cause)")
+    conn.commit()
+    conn.close()
+
+
+def ensure_guest_sessions_room_auth_columns():
+    conn = db()
+    cols = conn.execute("PRAGMA table_info(guest_sessions)").fetchall()
+    names = {c["name"] for c in cols}
+
+    if "auth_method" not in names:
+        conn.execute("ALTER TABLE guest_sessions ADD COLUMN auth_method TEXT DEFAULT 'call'")
+
+    if "room_num" not in names:
+        conn.execute("ALTER TABLE guest_sessions ADD COLUMN room_num TEXT")
+
+    if "surname" not in names:
+        conn.execute("ALTER TABLE guest_sessions ADD COLUMN surname TEXT")
+
+    conn.commit()
     conn.close()
