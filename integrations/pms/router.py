@@ -25,11 +25,7 @@ def pms_room_auth_allowed(room_num: str, surname: str, hotel: str | None = None,
 
         logger.info("opera using DB config for %s", opera_site_cfg.get("code"))
         
-        if opera_room_auth_allowed(
-            room_num,
-            surname,
-            property_code=opera_site_cfg.get("property_code"),
-        ):
+        if opera_room_auth_allowed(room_num, surname):
             return {
                 "ok": True,
                 "source": "opera",
