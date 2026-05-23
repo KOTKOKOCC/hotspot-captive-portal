@@ -302,6 +302,74 @@ def check_pms_api_guard_settings() -> None:
     ok("PMS API guard uses UI/database settings and fails closed")
 
 
+def check_legacy_dusit_routes_use_pms_router() -> None:
+    import app as app_module
+
+    class Client:
+        host = "127.0.0.1"
+
+    class FakeRequest:
+        client = Client()
+        headers = {}
+
+    original_get_setting = app_module.get_setting
+    original_router = app_module.pms_room_auth_allowed
+    original_save = app_module.save_verified_room_auth
+
+    calls = []
+    saved = []
+
+    def fake_get_setting(key, default=None):
+        if key == "pms_api.enabled":
+            return "0"
+        return default
+
+    def fake_router(room_num, surname, hotel=None, vlan_id=None):
+        calls.append({
+            "room_num": room_num,
+            "surname": surname,
+            "hotel": hotel,
+            "vlan_id": vlan_id,
+        })
+        return {"ok": True, "source": "opera", "hotel": hotel, "error": ""}
+
+    def fake_save_verified_room_auth(**kwargs):
+        saved.append(kwargs)
+
+    app_module.get_setting = fake_get_setting
+    app_module.pms_room_auth_allowed = fake_router
+    app_module.save_verified_room_auth = fake_save_verified_room_auth
+    try:
+        response = app_module.auth_dusit_room(
+            FakeRequest(),
+            {"room_num": "101", "surname": "Smith"},
+        )
+        if response.get("ok") is not True or response.get("source") != "opera":
+            fail("legacy Dusit room route did not accept PMS router result")
+
+        response = app_module.auth_dusit_authorize(
+            FakeRequest(),
+            {
+                "room_num": "101",
+                "surname": "Smith",
+                "mac": "AA:BB:CC:DD:EE:FF",
+                "ip": "10.0.0.5",
+                "nas_id": "nas-1",
+            },
+        )
+        if response.get("ok") is not True or not saved:
+            fail("legacy Dusit authorize route did not use PMS router result")
+
+        if any(call.get("hotel") != "Dusit" for call in calls):
+            fail("legacy Dusit routes did not restrict PMS lookup to configured Dusit site")
+    finally:
+        app_module.get_setting = original_get_setting
+        app_module.pms_room_auth_allowed = original_router
+        app_module.save_verified_room_auth = original_save
+
+    ok("legacy Dusit routes use the configured PMS router")
+
+
 def fetch_no_redirect(url: str):
     opener = urllib.request.build_opener(NoRedirect)
     request = urllib.request.Request(url, method="GET")
@@ -339,6 +407,7 @@ def main() -> None:
     check_opera_lookup_fallback()
     check_optional_api_guard()
     check_pms_api_guard_settings()
+    check_legacy_dusit_routes_use_pms_router()
 
     if args.base_url:
         check_http(args.base_url)

@@ -143,7 +143,7 @@ from ui import (
     admin_page,
 )
 
-from integrations.opera.lookup import room_auth_allowed, normalize_user_surname
+from integrations.opera.lookup import normalize_user_surname
 from room_auth import ensure_room_auth_table, save_verified_room_auth, get_verified_room_auth
 from integrations.pms.router import pms_room_auth_allowed
 
@@ -1755,9 +1755,14 @@ def auth_dusit_authorize(request: Request, payload: dict = Body(...)):
     if not room_num or not surname or not mac or not ip:
         raise HTTPException(status_code=400, detail="room_num_surname_mac_ip_required")
 
-    allowed = room_auth_allowed(room_num, surname)
-    if not allowed:
-        return {"ok": False, "status": "not_found"}
+    pms_result = pms_room_auth_allowed(room_num, surname, hotel="Dusit")
+    if not pms_result.get("ok"):
+        return {
+            "ok": False,
+            "status": "not_found",
+            "error": pms_result.get("error") or "",
+            "source": pms_result.get("source"),
+        }
 
     save_verified_room_auth(
         room_num=room_num,
@@ -5269,17 +5274,19 @@ def auth_dusit_room(request: Request, payload: dict = Body(...)):
 
     if not room_num or not surname:
         raise HTTPException(status_code=400, detail="room_num_and_surname_required")
-    allowed = room_auth_allowed(room_num, surname)
-
-    if not allowed:
+    pms_result = pms_room_auth_allowed(room_num, surname, hotel="Dusit")
+    if not pms_result.get("ok"):
         return {
             "ok": False,
-            "status": "not_found"
+            "status": "not_found",
+            "error": pms_result.get("error") or "",
+            "source": pms_result.get("source"),
         }
 
     return {
         "ok": True,
-        "status": "ok"
+        "status": "ok",
+        "source": pms_result.get("source"),
     }
 
 
