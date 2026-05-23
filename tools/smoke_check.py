@@ -134,6 +134,20 @@ def check_admin_tokens() -> None:
     ok("admin session tokens are signed, expiring, and database-backed")
 
 
+def check_opera_lookup_fallback() -> None:
+    from integrations.opera import lookup
+
+    original_db_path = lookup.DB_PATH
+    lookup.DB_PATH = str(PROJECT_ROOT / ".missing" / "opera_stays.db")
+    try:
+        if lookup.room_auth_allowed("101", "Smith") is not False:
+            fail("Opera lookup should fail closed when cache DB is unavailable")
+    finally:
+        lookup.DB_PATH = original_db_path
+
+    ok("Opera room lookup fails closed when cache DB is unavailable")
+
+
 def fetch_no_redirect(url: str):
     opener = urllib.request.build_opener(NoRedirect)
     request = urllib.request.Request(url, method="GET")
@@ -168,6 +182,7 @@ def main() -> None:
     check_routes()
     check_secrets(strict=args.strict_secrets)
     check_admin_tokens()
+    check_opera_lookup_fallback()
 
     if args.base_url:
         check_http(args.base_url)
