@@ -187,6 +187,60 @@ def check_opera_lookup_fallback() -> None:
     ok("Opera room lookup respects property_code when cache DB supports it")
 
 
+def check_optional_api_guard() -> None:
+    from fastapi import HTTPException
+
+    from api_security import ip_allowed, optional_api_guard
+
+    class Client:
+        def __init__(self, host: str):
+            self.host = host
+
+    class FakeRequest:
+        def __init__(self, host: str, headers: dict[str, str] | None = None):
+            self.client = Client(host)
+            self.headers = headers or {}
+
+    def assert_forbidden(fn, message: str) -> None:
+        try:
+            fn()
+        except HTTPException as exc:
+            if exc.status_code == 403:
+                return
+            fail(message + f": got status {exc.status_code}")
+        fail(message)
+
+    optional_api_guard(FakeRequest("10.0.0.5"), token="", allowed_ips=())
+
+    optional_api_guard(
+        FakeRequest("10.0.0.5", {"X-Internal-Token": "secret"}),
+        token="secret",
+        allowed_ips=(),
+    )
+    optional_api_guard(
+        FakeRequest("10.0.0.5", {"Authorization": "Bearer secret"}),
+        token="secret",
+        allowed_ips=(),
+    )
+
+    assert_forbidden(
+        lambda: optional_api_guard(FakeRequest("10.0.0.5"), token="secret", allowed_ips=()),
+        "optional API guard accepted a missing token",
+    )
+
+    if not ip_allowed("10.0.0.5", ["10.0.0.0/24"]):
+        fail("optional API guard CIDR allowlist did not match")
+    if ip_allowed("10.0.1.5", ["10.0.0.0/24"]):
+        fail("optional API guard CIDR allowlist matched wrong network")
+
+    assert_forbidden(
+        lambda: optional_api_guard(FakeRequest("10.0.1.5"), token="", allowed_ips=("10.0.0.0/24",)),
+        "optional API guard accepted a forbidden IP",
+    )
+
+    ok("optional API guard supports token and IP allowlists")
+
+
 def fetch_no_redirect(url: str):
     opener = urllib.request.build_opener(NoRedirect)
     request = urllib.request.Request(url, method="GET")
@@ -222,6 +276,7 @@ def main() -> None:
     check_secrets(strict=args.strict_secrets)
     check_admin_tokens()
     check_opera_lookup_fallback()
+    check_optional_api_guard()
 
     if args.base_url:
         check_http(args.base_url)

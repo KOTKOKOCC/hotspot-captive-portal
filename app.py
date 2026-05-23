@@ -92,7 +92,11 @@ from config import (
     DEVICE_LIMIT,
     PENDING_MINUTES,
     PBX_ALLOWED_IPS,
+    PMS_API_TOKEN,
+    PMS_ALLOWED_IPS,
 )
+
+from api_security import optional_api_guard
 
 from admin_auth import (
     make_admin_token,
@@ -1661,7 +1665,9 @@ def radius_check(payload: RadiusCheckIn):
 
 
 @app.post("/auth/dusit/authorize")
-def auth_dusit_authorize(payload: dict = Body(...)):
+def auth_dusit_authorize(request: Request, payload: dict = Body(...)):
+    optional_api_guard(request, PMS_API_TOKEN, PMS_ALLOWED_IPS)
+
     room_num = (payload.get("room_num") or "").strip()
     surname = (payload.get("surname") or "").strip()
     mac = (payload.get("mac") or "").strip()
@@ -1688,7 +1694,9 @@ def auth_dusit_authorize(payload: dict = Body(...)):
 
 
 @app.get("/auth-status")
-def auth_status(phone: str = Query(...)):
+def auth_status(request: Request, phone: str = Query(...)):
+    optional_api_guard(request, PMS_API_TOKEN, PMS_ALLOWED_IPS)
+
     try:
         phone = normalize_phone(phone)
     except ValueError:
@@ -5175,7 +5183,9 @@ def admin_client(
 
 
 @app.post("/auth/dusit/room")
-def auth_dusit_room(payload: dict = Body(...)):
+def auth_dusit_room(request: Request, payload: dict = Body(...)):
+    optional_api_guard(request, PMS_API_TOKEN, PMS_ALLOWED_IPS)
+
     room_num = (payload.get("room_num") or "").strip()
     surname = (payload.get("surname") or "").strip()
 
