@@ -135,6 +135,10 @@ def check_admin_tokens() -> None:
 
 
 def check_opera_lookup_fallback() -> None:
+    import sqlite3
+    import tempfile
+    from datetime import date, timedelta
+
     from integrations.opera import lookup
 
     original_db_path = lookup.DB_PATH
@@ -146,6 +150,41 @@ def check_opera_lookup_fallback() -> None:
         lookup.DB_PATH = original_db_path
 
     ok("Opera room lookup fails closed when cache DB is unavailable")
+
+    departure = (date.today() + timedelta(days=1)).strftime("%y%m%d")
+    with tempfile.TemporaryDirectory() as tmp:
+        test_db = Path(tmp) / "opera_stays.db"
+        with sqlite3.connect(test_db) as conn:
+            conn.execute("""
+                CREATE TABLE opera_stays (
+                    id INTEGER PRIMARY KEY,
+                    room_num TEXT,
+                    guest_surname_norm TEXT,
+                    departure_date TEXT,
+                    property_code TEXT,
+                    status TEXT
+                )
+            """)
+            conn.execute("""
+                INSERT INTO opera_stays (
+                    room_num, guest_surname_norm, departure_date, property_code, status
+                )
+                VALUES (?, ?, ?, ?, ?)
+            """, ("101", "smith", departure, "DUSIT", "active"))
+            conn.commit()
+
+        lookup.DB_PATH = str(test_db)
+        try:
+            if not lookup.room_auth_allowed("101", "Smith"):
+                fail("Opera lookup should match an active stay without property filter")
+            if not lookup.room_auth_allowed("101", "Smith", property_code="DUSIT"):
+                fail("Opera lookup should match an active stay with matching property")
+            if lookup.room_auth_allowed("101", "Smith", property_code="OTHER"):
+                fail("Opera lookup should reject an active stay from a different property")
+        finally:
+            lookup.DB_PATH = original_db_path
+
+    ok("Opera room lookup respects property_code when cache DB supports it")
 
 
 def fetch_no_redirect(url: str):

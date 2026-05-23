@@ -1671,7 +1671,7 @@ def auth_dusit_authorize(payload: dict = Body(...)):
     if not room_num or not surname or not mac or not ip:
         raise HTTPException(status_code=400, detail="room_num_surname_mac_ip_required")
 
-    allowed = room_auth_allowed(room_num, surname)
+    allowed = room_auth_allowed(room_num, surname, property_code="DUSIT")
     if not allowed:
         return {"ok": False, "status": "not_found"}
 
@@ -5181,7 +5181,7 @@ def auth_dusit_room(payload: dict = Body(...)):
 
     if not room_num or not surname:
         raise HTTPException(status_code=400, detail="room_num_and_surname_required")
-    allowed = room_auth_allowed(room_num, surname)
+    allowed = room_auth_allowed(room_num, surname, property_code="DUSIT")
 
     if not allowed:
         return {

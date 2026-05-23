@@ -31,7 +31,25 @@ def yymmdd_to_date(value: str):
     except ValueError:
         return None
 
-def room_auth_allowed(room_num: str, surname: str) -> bool:
+
+def _property_filter(conn: sqlite3.Connection, property_code: str | None):
+    property_code = (property_code or "").strip()
+    if not property_code:
+        return "", []
+
+    cols = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(opera_stays)").fetchall()
+    }
+
+    for column in ("property_code", "resort", "hotel_code", "site_code"):
+        if column in cols:
+            return f" AND lower({column}) = lower(?)", [property_code]
+
+    return "", []
+
+
+def room_auth_allowed(room_num: str, surname: str, property_code: str | None = None) -> bool:
     room_num = (room_num or "").strip()
     surname_norm = normalize_user_surname(surname)
 
@@ -42,14 +60,16 @@ def room_auth_allowed(room_num: str, surname: str) -> bool:
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
+            property_sql, property_params = _property_filter(conn, property_code)
 
-            cur.execute("""
+            cur.execute(f"""
                 SELECT departure_date
                 FROM opera_stays
                 WHERE status='active'
                   AND room_num=?
                   AND guest_surname_norm=?
-            """, (room_num, surname_norm))
+                  {property_sql}
+            """, (room_num, surname_norm, *property_params))
 
             rows = cur.fetchall()
     except sqlite3.Error as exc:
@@ -69,7 +89,7 @@ def room_auth_allowed(room_num: str, surname: str) -> bool:
 
     return False
 
-def debug_find_guests_by_room_and_surname(room_num: str, surname: str):
+def debug_find_guests_by_room_and_surname(room_num: str, surname: str, property_code: str | None = None):
     room_num = (room_num or "").strip()
     surname_norm = normalize_user_surname(surname)
 
@@ -80,16 +100,18 @@ def debug_find_guests_by_room_and_surname(room_num: str, surname: str):
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
+            property_sql, property_params = _property_filter(conn, property_code)
 
-            cur.execute("""
+            cur.execute(f"""
                 SELECT id, guest_num, room_num, guest_name_raw, guest_first_name,
                        arrival_date, departure_date, share_flag, status
                 FROM opera_stays
                 WHERE status='active'
                   AND room_num=?
                   AND guest_surname_norm=?
+                  {property_sql}
                 ORDER BY id
-            """, (room_num, surname_norm))
+            """, (room_num, surname_norm, *property_params))
 
             rows = [dict(r) for r in cur.fetchall()]
             return rows
