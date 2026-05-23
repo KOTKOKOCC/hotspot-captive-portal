@@ -241,6 +241,67 @@ def check_optional_api_guard() -> None:
     ok("optional API guard supports token and IP allowlists")
 
 
+def check_pms_api_guard_settings() -> None:
+    from fastapi import HTTPException
+
+    import app as app_module
+
+    class Client:
+        def __init__(self, host: str):
+            self.host = host
+
+    class FakeRequest:
+        def __init__(self, host: str, headers: dict[str, str] | None = None):
+            self.client = Client(host)
+            self.headers = headers or {}
+
+    def assert_forbidden(fn, message: str) -> None:
+        try:
+            fn()
+        except HTTPException as exc:
+            if exc.status_code == 403:
+                return
+            fail(message + f": got status {exc.status_code}")
+        fail(message)
+
+    values = {}
+    original_get_setting = app_module.get_setting
+
+    def fake_get_setting(key, default=None):
+        return values.get(key, default)
+
+    app_module.get_setting = fake_get_setting
+    try:
+        values.clear()
+        values.update({"pms_api.enabled": "0"})
+        app_module.pms_api_guard(FakeRequest("10.0.0.5"))
+
+        values.clear()
+        values.update({
+            "pms_api.enabled": "1",
+            "pms_api.token": "",
+            "pms_api.allowed_ips": "",
+        })
+        assert_forbidden(
+            lambda: app_module.pms_api_guard(FakeRequest("10.0.0.5")),
+            "PMS API guard allowed traffic while enabled without token or IP allowlist",
+        )
+
+        values.clear()
+        values.update({
+            "pms_api.enabled": "1",
+            "pms_api.token": "secret",
+            "pms_api.allowed_ips": "",
+        })
+        app_module.pms_api_guard(
+            FakeRequest("10.0.0.5", {"Authorization": "Bearer secret"})
+        )
+    finally:
+        app_module.get_setting = original_get_setting
+
+    ok("PMS API guard uses UI/database settings and fails closed")
+
+
 def fetch_no_redirect(url: str):
     opener = urllib.request.build_opener(NoRedirect)
     request = urllib.request.Request(url, method="GET")
@@ -277,6 +338,7 @@ def main() -> None:
     check_admin_tokens()
     check_opera_lookup_fallback()
     check_optional_api_guard()
+    check_pms_api_guard_settings()
 
     if args.base_url:
         check_http(args.base_url)

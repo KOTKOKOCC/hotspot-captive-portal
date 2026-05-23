@@ -20,13 +20,6 @@ PBX_ALLOWED_IPS = [
     if ip.strip()
 ]
 
-PMS_API_TOKEN = os.getenv("PMS_API_TOKEN", "").strip()
-PMS_ALLOWED_IPS = [
-    ip.strip()
-    for ip in os.getenv("PMS_ALLOWED_IPS", "").split(",")
-    if ip.strip()
-]
-
 APP_NAME = os.getenv("APP_NAME", "C-Portal")
 DB_PATH = os.getenv("DB_PATH", str(BASE_DIR / "hotspot.db"))
 OPERA_CACHE_DB_PATH = os.getenv(
@@ -43,4 +36,3 @@ ADMIN_COOKIE = os.getenv("ADMIN_COOKIE", "hotspot_admin")
 
 DEVICE_LIMIT = int(os.getenv("DEVICE_LIMIT", "5"))
 PENDING_MINUTES = int(os.getenv("PENDING_MINUTES", "10"))
-

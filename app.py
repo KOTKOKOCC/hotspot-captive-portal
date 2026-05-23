@@ -92,8 +92,6 @@ from config import (
     DEVICE_LIMIT,
     PENDING_MINUTES,
     PBX_ALLOWED_IPS,
-    PMS_API_TOKEN,
-    PMS_ALLOWED_IPS,
 )
 
 from api_security import optional_api_guard
@@ -357,6 +355,25 @@ def get_opera_fias_status():
 
     return status
 
+
+def pms_api_guard(request: Request) -> None:
+    enabled = str(get_setting("pms_api.enabled", "0")) == "1"
+    if not enabled:
+        return
+
+    token = str(get_setting("pms_api.token", "") or "").strip()
+    allowed_ips_raw = str(get_setting("pms_api.allowed_ips", "") or "")
+    allowed_ips = [
+        ip.strip()
+        for ip in allowed_ips_raw.split(",")
+        if ip.strip()
+    ]
+
+    if not token and not allowed_ips:
+        raise HTTPException(status_code=403, detail="pms_api_guard_not_configured")
+
+    optional_api_guard(request, token=token, allowed_ips=allowed_ips)
+
 _ONEC_STATUS_CACHE = {}
 
 
@@ -543,6 +560,10 @@ def build_settings_body(ok: str = ""):
     pbx_enabled = str(get_setting("pbx.enabled", "1")) == "1"
     pbx_allowed_ips = str(get_setting("pbx.allowed_ips", ",".join(PBX_ALLOWED_IPS)))
 
+    pms_api_enabled = str(get_setting("pms_api.enabled", "0")) == "1"
+    pms_allowed_ips = str(get_setting("pms_api.allowed_ips", ""))
+    pms_token_is_set = bool(str(get_setting("pms_api.token", "") or "").strip())
+    pms_token_placeholder = "Токен задан" if pms_token_is_set else "Новый токен"
 
     body = f"""
     <div class="settings-page">
@@ -550,8 +571,8 @@ def build_settings_body(ok: str = ""):
       <div class="settings-card">
         <h2>Настройки приложения</h2>
         <p class="settings-muted">
-          Эти параметры сохраняются в базе данных. Если значение не задано здесь,
-          приложение использует fallback из .env.
+          Рабочие параметры сохраняются в базе данных. .env остаётся техническим
+          файлом установки для секретов и путей, которые создаёт install.
         </p>
         {ok_html}
       </div>
@@ -617,6 +638,43 @@ def build_settings_body(ok: str = ""):
 
             <div class="settings-field" style="align-self:end;">
               <button type="submit" class="btn btn-primary">Сохранить PBX</button>
+            </div>
+          </div>
+        </form>
+      </div>
+
+
+      <div class="settings-card">
+        <form method="post" action="/admin/settings/pms-api">
+          <h3 style="margin:0 0 12px;">PMS API</h3>
+
+          <div class="settings-grid settings-grid-pbx">
+            <div class="settings-field">
+              <label>Защита включена</label>
+              <select name="pms_api_enabled">
+                <option value="0" {"" if pms_api_enabled else "selected"}>Нет</option>
+                <option value="1" {"selected" if pms_api_enabled else ""}>Да</option>
+              </select>
+            </div>
+
+            <div class="settings-field">
+              <label>Разрешённые IP / CIDR</label>
+              <input type="text"
+                   name="pms_allowed_ips"
+                   value="{escape(pms_allowed_ips)}"
+                   placeholder="10.99.0.0/24,127.0.0.1">
+            </div>
+
+            <div class="settings-field">
+              <label>Токен</label>
+              <input type="password"
+                   name="pms_api_token"
+                   value=""
+                   placeholder="{escape(pms_token_placeholder)}">
+            </div>
+
+            <div class="settings-field" style="align-self:end;">
+              <button type="submit" class="btn btn-primary">Сохранить PMS API</button>
             </div>
           </div>
         </form>
@@ -832,6 +890,26 @@ def admin_settings_pbx(
     set_setting("pbx.allowed_ips", pbx_allowed_ips.strip())
 
     return RedirectResponse(url="/admin/system?section=settings&ok=pbx", status_code=303)
+
+
+@app.post("/admin/settings/pms-api")
+def admin_settings_pms_api(
+    request: Request,
+    pms_api_enabled: str = Form("0"),
+    pms_allowed_ips: str = Form(""),
+    pms_api_token: str = Form(""),
+):
+    guard = role_guard(request, ("superadmin",))
+    if guard:
+        return guard
+
+    set_setting("pms_api.enabled", "1" if pms_api_enabled == "1" else "0")
+    set_setting("pms_api.allowed_ips", pms_allowed_ips.strip())
+
+    if pms_api_token.strip():
+        set_setting("pms_api.token", pms_api_token.strip(), is_secret=True)
+
+    return RedirectResponse(url="/admin/system?section=settings&ok=pms_api", status_code=303)
 
 
 @app.post("/admin/settings/onec")
@@ -1666,7 +1744,7 @@ def radius_check(payload: RadiusCheckIn):
 
 @app.post("/auth/dusit/authorize")
 def auth_dusit_authorize(request: Request, payload: dict = Body(...)):
-    optional_api_guard(request, PMS_API_TOKEN, PMS_ALLOWED_IPS)
+    pms_api_guard(request)
 
     room_num = (payload.get("room_num") or "").strip()
     surname = (payload.get("surname") or "").strip()
@@ -1695,7 +1773,7 @@ def auth_dusit_authorize(request: Request, payload: dict = Body(...)):
 
 @app.get("/auth-status")
 def auth_status(request: Request, phone: str = Query(...)):
-    optional_api_guard(request, PMS_API_TOKEN, PMS_ALLOWED_IPS)
+    pms_api_guard(request)
 
     try:
         phone = normalize_phone(phone)
@@ -5184,7 +5262,7 @@ def admin_client(
 
 @app.post("/auth/dusit/room")
 def auth_dusit_room(request: Request, payload: dict = Body(...)):
-    optional_api_guard(request, PMS_API_TOKEN, PMS_ALLOWED_IPS)
+    pms_api_guard(request)
 
     room_num = (payload.get("room_num") or "").strip()
     surname = (payload.get("surname") or "").strip()
