@@ -448,7 +448,97 @@ def check_onec_site_status(site: dict) -> bool:
 
         return False
 
-def build_settings_body(ok: str = ""):
+
+PMS_CHECK_ERROR_LABELS = {
+    "hotel_not_resolved": "Объект не выбран",
+    "pms_not_configured_for_hotel": "Для объекта не настроен включенный PMS",
+    "guest_not_found": "Гость не найден",
+    "1c_site_not_configured_or_disabled": "Объект 1C выключен или не настроен",
+    "1c_site_missing_token_or_url": "У объекта 1C не указан URL или токен",
+}
+
+
+def get_pms_check_hotels() -> list[str]:
+    rows = fetch_all("""
+        SELECT DISTINCT hotel_name
+        FROM network_map
+        WHERE is_active = 1
+          AND hotel_name IS NOT NULL
+          AND TRIM(hotel_name) != ''
+        ORDER BY lower(hotel_name)
+    """)
+
+    return [str(row["hotel_name"]) for row in rows]
+
+
+def pms_check_error_label(error: str) -> str:
+    error = (error or "").strip()
+    return PMS_CHECK_ERROR_LABELS.get(error, error or "Нет деталей")
+
+
+def build_pms_check_result_html(pms_check: dict | None) -> str:
+    if not pms_check:
+        return ""
+
+    result = pms_check.get("result") or {}
+    ok = bool(result.get("ok"))
+    source = str(result.get("source") or "не выбран")
+    error = str(result.get("error") or "")
+    hotel = str(pms_check.get("hotel") or "")
+    room_num = str(pms_check.get("room_num") or "")
+
+    config_errors = {
+        "hotel_not_resolved",
+        "pms_not_configured_for_hotel",
+        "1c_site_not_configured_or_disabled",
+        "1c_site_missing_token_or_url",
+    }
+
+    if ok:
+        title = "Гость найден"
+        color = "rgba(22, 163, 74, .16)"
+        border = "rgba(22, 163, 74, .36)"
+        interface_text = "Интерфейс ответил"
+        guest_text = "Портал пустит гостя по номеру и фамилии"
+    elif error in config_errors:
+        title = "PMS не готов к проверке"
+        color = "rgba(245, 158, 11, .18)"
+        border = "rgba(245, 158, 11, .38)"
+        interface_text = pms_check_error_label(error)
+        guest_text = "Гость не проверялся"
+    else:
+        title = "Гость не найден"
+        color = "rgba(153, 27, 27, .16)"
+        border = "rgba(248, 113, 113, .35)"
+        interface_text = "Интерфейс ответил" if source != "не выбран" else "PMS не выбран"
+        guest_text = pms_check_error_label(error)
+
+    details = []
+    if result.get("reservation_number"):
+        details.append(f"Бронь: {escape(str(result.get('reservation_number')))}")
+    if result.get("checkin_date"):
+        details.append(f"Заезд: {escape(str(result.get('checkin_date')))}")
+    if result.get("checkout_date"):
+        details.append(f"Выезд: {escape(str(result.get('checkout_date')))}")
+
+    details_html = ""
+    if details:
+        details_html = "<br>" + "<br>".join(details)
+
+    return f"""
+      <div class="notice" style="margin-top:14px; padding:14px 16px; border-radius:14px; background:{color}; border:1px solid {border};">
+        <b>{escape(title)}</b><br>
+        Объект: {escape(hotel or "-")}<br>
+        Комната: {escape(room_num or "-")}<br>
+        PMS: {escape(source)}<br>
+        Интерфейс: {escape(interface_text)}<br>
+        Гость: {escape(guest_text)}
+        {details_html}
+      </div>
+    """
+
+
+def build_settings_body(ok: str = "", pms_check: dict | None = None):
 
     mt_host = escape(str(get_setting("mikrotik.host", "")))
     mt_port = escape(str(get_setting("mikrotik.port", "8728")))
@@ -565,6 +655,23 @@ def build_settings_body(ok: str = ""):
     pms_token_is_set = bool(str(get_setting("pms_api.token", "") or "").strip())
     pms_token_placeholder = "Токен задан" if pms_token_is_set else "Новый токен"
 
+    pms_check = pms_check or {}
+    pms_check_hotel = str(pms_check.get("hotel") or "")
+    pms_check_room = str(pms_check.get("room_num") or "")
+    pms_check_surname = str(pms_check.get("surname") or "")
+    pms_check_options = ['<option value="">Выберите объект</option>']
+
+    for hotel_name in get_pms_check_hotels():
+        selected = " selected" if hotel_name == pms_check_hotel else ""
+        pms_check_options.append(
+            f'<option value="{escape(hotel_name)}"{selected}>{escape(hotel_name)}</option>'
+        )
+
+    if len(pms_check_options) == 1:
+        pms_check_options.append('<option value="" disabled>Активные сети не настроены</option>')
+
+    pms_check_result_html = build_pms_check_result_html(pms_check)
+
     body = f"""
     <div class="settings-page">
 
@@ -677,6 +784,46 @@ def build_settings_body(ok: str = ""):
               <button type="submit" class="btn btn-primary">Сохранить PMS API</button>
             </div>
           </div>
+        </form>
+      </div>
+
+
+      <div class="settings-card">
+        <form method="post" action="/admin/settings/pms-check">
+          <h3 style="margin:0 0 12px;">Проверка PMS авторизации</h3>
+
+          <div class="settings-grid" style="grid-template-columns:minmax(220px,1fr) 130px minmax(220px,1fr) 170px;">
+            <div class="settings-field">
+              <label>Объект</label>
+              <select name="hotel" required>
+                {"".join(pms_check_options)}
+              </select>
+            </div>
+
+            <div class="settings-field">
+              <label>Комната</label>
+              <input type="text"
+                   name="room_num"
+                   value="{escape(pms_check_room)}"
+                   placeholder="101"
+                   required>
+            </div>
+
+            <div class="settings-field">
+              <label>Фамилия</label>
+              <input type="text"
+                   name="surname"
+                   value="{escape(pms_check_surname)}"
+                   placeholder="Ivanov"
+                   required>
+            </div>
+
+            <div class="settings-field" style="align-self:end;">
+              <button type="submit" class="btn btn-primary">Проверить</button>
+            </div>
+          </div>
+
+          {pms_check_result_html}
         </form>
       </div>
 
@@ -910,6 +1057,35 @@ def admin_settings_pms_api(
         set_setting("pms_api.token", pms_api_token.strip(), is_secret=True)
 
     return RedirectResponse(url="/admin/system?section=settings&ok=pms_api", status_code=303)
+
+
+@app.post("/admin/settings/pms-check", response_class=HTMLResponse)
+def admin_settings_pms_check(
+    request: Request,
+    hotel: str = Form(""),
+    room_num: str = Form(""),
+    surname: str = Form(""),
+):
+    guard = role_guard(request, ("superadmin",))
+    if guard:
+        return guard
+
+    username, role = get_current_admin_user(request)
+
+    hotel = hotel.strip()
+    room_num = room_num.strip()
+    surname = surname.strip()
+
+    result = pms_room_auth_allowed(room_num, surname, hotel=hotel)
+    pms_check = {
+        "hotel": hotel,
+        "room_num": room_num,
+        "surname": surname,
+        "result": result,
+    }
+
+    content = build_system_tabs("settings") + build_settings_body(pms_check=pms_check)
+    return admin_page("Система", content, active_tab="system", role=role)
 
 
 @app.post("/admin/settings/onec")
@@ -3963,6 +4139,20 @@ def admin_find(request: Request, q: str = ""):
     return admin_page("Поиск", body, active_tab="find", role=role)    
 
 
+def build_system_tabs(section: str) -> str:
+    section = (section or "export").strip()
+    return f"""
+    <div class="system-actions">
+      <a class="btn {'primary' if section == 'export' else ''}" href="/admin/system?section=export">Выгрузка</a>
+      <a class="btn {'primary' if section == 'networks' else ''}" href="/admin/system?section=networks">Сети</a>
+      <a class="btn {'primary' if section == 'users' else ''}" href="/admin/system?section=users">Пользователи</a>
+      <a class="btn {'primary' if section == 'settings' else ''}" href="/admin/system?section=settings">Настройки</a>
+      <a class="btn {'primary' if section == 'logs' else ''}" href="/admin/system?section=logs">Логи</a>
+      <a class="btn {'primary' if section == 'service' else ''}" href="/admin/system?section=service">Сервис</a>
+    </div>
+    """
+
+
 @app.get("/admin/system", response_class=HTMLResponse)
 def admin_system(request: Request, section: str = "export", password_id: str = "", ok: str = ""):
     guard = role_guard(request, ("superadmin",))
@@ -3973,16 +4163,7 @@ def admin_system(request: Request, section: str = "export", password_id: str = "
 
     section = (section or "export").strip()
 
-    tabs = f"""
-    <div class="system-actions">
-      <a class="btn {'primary' if section == 'export' else ''}" href="/admin/system?section=export">Выгрузка</a>
-      <a class="btn {'primary' if section == 'networks' else ''}" href="/admin/system?section=networks">Сети</a>
-      <a class="btn {'primary' if section == 'users' else ''}" href="/admin/system?section=users">Пользователи</a>
-      <a class="btn {'primary' if section == 'settings' else ''}" href="/admin/system?section=settings">Настройки</a>
-      <a class="btn {'primary' if section == 'logs' else ''}" href="/admin/system?section=logs">Логи</a>
-      <a class="btn {'primary' if section == 'service' else ''}" href="/admin/system?section=service">Сервис</a>
-    </div>
-    """
+    tabs = build_system_tabs(section)
 
     if section == "export":
         content = """

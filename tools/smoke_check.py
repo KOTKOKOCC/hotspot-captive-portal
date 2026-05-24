@@ -17,6 +17,7 @@ CRITICAL_ROUTES = {
     ("GET", "/admin/login"),
     ("GET", "/admin/settings"),
     ("GET", "/admin/system"),
+    ("POST", "/admin/settings/pms-check"),
 }
 
 
@@ -370,6 +371,39 @@ def check_legacy_dusit_routes_use_pms_router() -> None:
     ok("legacy Dusit routes use the configured PMS router")
 
 
+def check_pms_check_result_renderer() -> None:
+    from app import build_pms_check_result_html
+
+    found_html = build_pms_check_result_html({
+        "hotel": "FioLeto",
+        "room_num": "101",
+        "surname": "Smith",
+        "result": {"ok": True, "source": "1c", "error": ""},
+    })
+    if "Гость найден" not in found_html or "Портал пустит гостя" not in found_html:
+        fail("PMS check renderer did not render successful guest result")
+
+    missing_html = build_pms_check_result_html({
+        "hotel": "FioLeto",
+        "room_num": "101",
+        "surname": "Smith",
+        "result": {"ok": False, "source": "1c", "error": "guest_not_found"},
+    })
+    if "Гость не найден" not in missing_html:
+        fail("PMS check renderer did not render guest_not_found result")
+
+    config_html = build_pms_check_result_html({
+        "hotel": "Unknown",
+        "room_num": "101",
+        "surname": "Smith",
+        "result": {"ok": False, "source": None, "error": "pms_not_configured_for_hotel"},
+    })
+    if "PMS не готов к проверке" not in config_html:
+        fail("PMS check renderer did not render configuration failure")
+
+    ok("PMS check renderer explains found, not found, and config states")
+
+
 def fetch_no_redirect(url: str):
     opener = urllib.request.build_opener(NoRedirect)
     request = urllib.request.Request(url, method="GET")
@@ -408,6 +442,7 @@ def main() -> None:
     check_optional_api_guard()
     check_pms_api_guard_settings()
     check_legacy_dusit_routes_use_pms_router()
+    check_pms_check_result_renderer()
 
     if args.base_url:
         check_http(args.base_url)
