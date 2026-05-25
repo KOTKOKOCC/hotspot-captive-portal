@@ -159,6 +159,7 @@ from logging_config import setup_logging
 
 setup_logging()
 logger = logging.getLogger(__name__)
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def mask_phone(phone: str | None) -> str:
@@ -242,6 +243,16 @@ def service_badge(status: str) -> str:
     return f'<span class="badge pending">{escape(status)}</span>'
 
 
+def readiness_badge(status: str) -> str:
+    labels = {
+        "ok": ("active", "ok"),
+        "warn": ("pending", "attention"),
+        "bad": ("error", "problem"),
+    }
+    cls, label = labels.get(status, ("pending", status or "unknown"))
+    return f'<span class="badge {cls}">{escape(label)}</span>'
+
+
 def get_wal_size() -> dict:
     path = DB_PATH + "-wal"
     if not os.path.exists(path):
@@ -249,6 +260,154 @@ def get_wal_size() -> dict:
 
     size = os.path.getsize(path)
     return {"bytes": size, "text": human_bytes(size)}
+
+
+def udp_port_listening(port: int) -> bool:
+    try:
+        r = subprocess.run(
+            ["ss", "-lun"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return f":{port} " in r.stdout or f":{port}\n" in r.stdout
+    except Exception:
+        return False
+
+
+def get_network_counts() -> dict:
+    try:
+        row = fetch_one("""
+            SELECT
+                COUNT(*) AS total,
+                COALESCE(SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END), 0) AS active
+            FROM network_map
+        """)
+        return {
+            "total": int(row["total"] or 0) if row else 0,
+            "active": int(row["active"] or 0) if row else 0,
+        }
+    except Exception:
+        return {"total": 0, "active": 0}
+
+
+def get_last_radius_event() -> dict:
+    try:
+        row = fetch_one("""
+            SELECT event_type, event_time
+            FROM audit_log
+            WHERE event_type LIKE 'radius_%'
+               OR event_type = 'pending_created'
+            ORDER BY event_time DESC
+            LIMIT 1
+        """)
+        if not row:
+            return {"event_type": "", "event_time": ""}
+        return {
+            "event_type": str(row["event_type"] or ""),
+            "event_time": str(row["event_time"] or ""),
+        }
+    except Exception:
+        return {"event_type": "", "event_time": ""}
+
+
+def build_readiness_rows(service_statuses: dict[str, str]) -> str:
+    rows = []
+
+    def add(title: str, status: str, details: str, href: str = "") -> None:
+        title_html = escape(title)
+        if href:
+            title_html = f'<a href="{escape(href)}">{title_html}</a>'
+        rows.append(f"""
+          <tr>
+            <td>{title_html}</td>
+            <td>{readiness_badge(status)}</td>
+            <td>{escape(details)}</td>
+          </tr>
+        """)
+
+    portal_active = service_statuses.get("portal") == "active"
+    radius_active = service_statuses.get("freeradius") == "active"
+    radius_ports_ok = udp_port_listening(1812) and udp_port_listening(1813)
+    summary_path = os.path.join(APP_DIR, "setup-summary.txt")
+    networks = get_network_counts()
+
+    mt_host = str(get_setting("mikrotik.host", "") or "").strip()
+    mt_user = str(get_setting("mikrotik.user", "") or "").strip()
+    mt_password = str(get_setting("mikrotik.password", "") or "").strip()
+
+    onec_sites = list_onec_sites()
+    opera_sites = list_opera_sites()
+    onec_active = sum(1 for site in onec_sites if site.get("enabled"))
+    opera_active = sum(1 for site in opera_sites if site.get("enabled"))
+
+    pbx_enabled = str(get_setting("pbx.enabled", "1")) == "1"
+    pbx_allowed_ips = str(get_setting("pbx.allowed_ips", ",".join(PBX_ALLOWED_IPS)) or "").strip()
+
+    last_radius = get_last_radius_event()
+    opera_status = get_opera_fias_status()
+
+    add(
+        "Portal backend",
+        "ok" if portal_active else "bad",
+        "systemd active" if portal_active else f"systemd {service_statuses.get('portal', 'unknown')}",
+    )
+    add(
+        "FreeRADIUS",
+        "ok" if radius_active and radius_ports_ok else "bad",
+        "service active, UDP 1812/1813 listening"
+        if radius_active and radius_ports_ok
+        else f"service {service_statuses.get('freeradius', 'unknown')}, ports {'ok' if radius_ports_ok else 'not ready'}",
+    )
+    add(
+        "Setup summary",
+        "ok" if os.path.exists(summary_path) else "warn",
+        summary_path if os.path.exists(summary_path) else "setup-summary.txt not found",
+    )
+    add(
+        "Networks",
+        "ok" if networks["active"] > 0 else "warn",
+        f"{networks['active']} active / {networks['total']} total",
+        "/admin/system?section=networks",
+    )
+    add(
+        "MikroTik",
+        "ok" if mt_host and mt_user and mt_password else "warn",
+        "host, user and password configured"
+        if mt_host and mt_user and mt_password
+        else "not fully configured",
+        "/admin/system?section=settings",
+    )
+    add(
+        "PBX / Asterisk",
+        "ok" if pbx_enabled and pbx_allowed_ips else "warn",
+        "enabled with allowed IPs"
+        if pbx_enabled and pbx_allowed_ips
+        else ("disabled" if not pbx_enabled else "allowed IPs are empty"),
+        "/admin/system?section=settings",
+    )
+    add(
+        "PMS objects",
+        "ok" if (onec_active + opera_active) > 0 else "warn",
+        f"1C active: {onec_active}, Opera active: {opera_active}",
+        "/admin/system?section=settings",
+    )
+    add(
+        "Last RADIUS request",
+        "ok" if last_radius["event_time"] else "warn",
+        f"{format_dt(last_radius['event_time'])} / {last_radius['event_type']}"
+        if last_radius["event_time"]
+        else "no radius-check events yet",
+        "/admin/audit",
+    )
+    add(
+        "Last Opera/FIAS RX",
+        "ok" if opera_status.get("last_event") else "warn",
+        str(opera_status.get("last_event") or "no FIAS events yet"),
+        "/admin/system?section=settings",
+    )
+
+    return "".join(rows)
 
 @app.get("/admin/system/service/status-json")
 def admin_system_service_status_json(request: Request):
@@ -4363,20 +4522,41 @@ def admin_system(request: Request, section: str = "export", password_id: str = "
             ("FreeRADIUS", "freeradius", "freeradius.service"),
         ]
 
+        service_statuses = {
+            key: systemctl_is_active(unit)
+            for _, key, unit in services
+        }
+
         service_rows = "".join(
             f"""
             <tr>
               <td>{escape(title)}</td>
               <td>{escape(unit)}</td>
-              <td id="svc-status-{key}">{service_badge(systemctl_is_active(unit))}</td>
+              <td id="svc-status-{key}">{service_badge(service_statuses.get(key, "unknown"))}</td>
             </tr>
             """
             for title, key, unit in services
         )
+        readiness_rows = build_readiness_rows(service_statuses)
 
         content = f"""
         <div class="system-section">
           <h2>Сервис</h2>
+
+          <div class="table-wrap" style="margin-bottom:16px;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Проверка готовности</th>
+                  <th>Статус</th>
+                  <th>Детали</th>
+                </tr>
+              </thead>
+              <tbody>
+                {readiness_rows}
+              </tbody>
+            </table>
+          </div>
 
           <div class="system-stats system-stats-compact">
             <div class="stat">
