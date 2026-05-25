@@ -1,46 +1,47 @@
 # Hotspot Captive Portal
 
-Native guest Wi-Fi captive portal for hotels and resorts.
+[Русский](README.md) | [English](README.en.md)
 
-The project combines a FastAPI admin panel, MikroTik Hotspot/RADIUS integration,
-phone call verification, room/surname PMS checks, vouchers, audit, exports, and
-basic service monitoring in one installable server application.
+Нативный портал авторизации гостевого Wi-Fi для отелей и курортов.
 
-Current version: `0.9.1`
+Проект объединяет FastAPI-приложение, админ-панель, интеграцию с MikroTik
+Hotspot/RADIUS, подтверждение по звонку, проверку гостей по номеру комнаты и
+фамилии через PMS, ваучеры, аудит, выгрузки и базовый мониторинг сервисов.
 
-## What It Does
+Текущая версия: `0.9.1`
 
-- Authorizes guests by phone number and confirmation call.
-- Authorizes hotel guests by room number and surname.
-- Reuses verified devices across configured hotel networks.
-- Routes PMS checks by guest network, VLAN, subnet, or object mapping.
-- Supports 1C/PMS HTTP verification.
-- Supports Opera/FIAS-based room lookup through a local stay cache.
-- Receives RADIUS authorization and accounting from FreeRADIUS.
-- Tracks guests, sessions, pending confirmations, call events, vouchers, and audit events.
-- Provides an admin UI for networks, users, PMS objects, logs, service status, and exports.
-- Installs systemd services and writes a local setup summary with generated credentials.
+## Что умеет
 
-## Status
+- Авторизует гостей по номеру телефона и подтверждающему звонку.
+- Авторизует гостей отеля по номеру комнаты и фамилии.
+- Позволяет уже подтвержденным устройствам подключаться на других объектах.
+- Определяет объект по сети гостя: IP, подсеть, VLAN и настройка в админке.
+- Поддерживает проверку через 1C/PMS HTTP API.
+- Поддерживает Opera/FIAS через локальную базу проживающих гостей.
+- Получает RADIUS-запросы авторизации и accounting от FreeRADIUS.
+- Ведет гостей, сессии, ожидания подтверждения, звонки, ваучеры и аудит.
+- Дает админку для сетей, пользователей, PMS-объектов, логов, сервисов и выгрузок.
+- Устанавливает systemd-сервисы и сохраняет памятку с сгенерированными доступами.
 
-`0.9.x` is a working production line. It is already suitable for controlled
-deployments, but the codebase is still being cleaned up. The main application
-file is intentionally going to be split into smaller modules in upcoming
-versions.
+## Статус
 
-## Requirements
+Линейка `0.9.x` уже работает в production-сценарии и подходит для аккуратных
+внедрений. При этом кодовая база еще приводится в порядок: главный файл
+приложения будет постепенно разнесен на модули без изменения поведения.
 
-- Ubuntu 22.04+ recommended.
+## Требования
+
+- Ubuntu 22.04+ рекомендуется.
 - Python 3.10+.
 - `python3-venv`.
-- Root access for systemd and FreeRADIUS setup.
-- MikroTik Hotspot configured to use RADIUS.
-- Optional: PBX/Asterisk callback integration.
-- Optional: 1C/PMS or Opera/FIAS integration.
+- root-доступ для установки systemd-сервисов и FreeRADIUS.
+- MikroTik Hotspot с RADIUS-авторизацией.
+- Опционально: PBX/Asterisk для подтверждения звонком.
+- Опционально: 1C/PMS или Opera/FIAS для проверки гостей отеля.
 
-## Quick Install
+## Быстрая установка
 
-On a clean server:
+На чистом сервере:
 
 ```bash
 sudo -i
@@ -51,20 +52,20 @@ cd /opt/hotspot-captive-portal
 ./setup.sh --yes
 ```
 
-After installation, open the admin panel URL shown by the installer.
+После установки откройте URL админ-панели, который покажет установщик.
 
-The installer also writes:
+Установщик также сохраняет памятку:
 
 ```text
 /opt/hotspot-captive-portal/setup-summary.txt
 ```
 
-This file contains the generated admin password and FreeRADIUS shared secret.
-Keep it private.
+В ней указаны сгенерированные данные администратора и shared secret для
+FreeRADIUS. Файл нужно хранить приватно.
 
-## Upgrade
+## Обновление
 
-For an existing Git-based install:
+Для установки, которая уже привязана к Git:
 
 ```bash
 cd /opt/hotspot-captive-portal
@@ -72,10 +73,10 @@ git pull --ff-only
 sudo ./setup.sh --upgrade
 ```
 
-By default, `--upgrade` does not reconfigure FreeRADIUS. This protects existing
-RADIUS configuration on production machines.
+По умолчанию `--upgrade` не перенастраивает FreeRADIUS. Это сделано специально,
+чтобы не затирать рабочую RADIUS-конфигурацию на production-сервере.
 
-Useful upgrade flags:
+Полезные флаги:
 
 ```bash
 sudo ./setup.sh --upgrade --with-radius
@@ -83,76 +84,77 @@ sudo ./setup.sh --upgrade --skip-radius
 sudo ./setup.sh --upgrade --skip-smoke
 ```
 
-## First Login
+## Первый вход
 
-Open:
+Откройте:
 
 ```text
 http://SERVER_IP:8080/admin/login
 ```
 
-Then go to `Система` and configure:
+Дальше перейдите в `Система` и настройте:
 
-- `Сети`: hotel/object network mappings.
-- `Пользователи`: admin, IT, and reception accounts.
-- `Настройки`: MikroTik, PBX, PMS API, 1C/PMS objects, Opera/FIAS objects.
-- `Сервис`: readiness checks, service status, CPU/RAM/Disk, logs, restart button.
+- `Сети`: соответствие объектов, Wi-Fi сетей, VLAN и подсетей.
+- `Пользователи`: учетные записи администратора, IT и ресепшена.
+- `Настройки`: MikroTik, PBX, PMS API, объекты 1C/PMS и Opera/FIAS.
+- `Сервис`: состояние сервисов, готовность системы, CPU/RAM/Disk, логи и рестарт.
 
-Most operational settings are stored in SQLite and managed through the UI.
-The `.env` file is kept as an installation/runtime file for secrets and paths.
+Большая часть рабочих настроек хранится в SQLite и редактируется через UI.
+Файл `.env` остается техническим файлом установки: секреты, пути и базовые
+runtime-параметры.
 
-## Guest Authorization Flow
+## Как проходит авторизация гостя
 
-1. A guest connects to MikroTik Hotspot.
-2. MikroTik asks FreeRADIUS.
-3. FreeRADIUS calls the portal `/radius-check` endpoint.
-4. The portal detects the object by IP/subnet/VLAN/network mapping.
-5. Known active sessions and known MACs are accepted immediately.
-6. Phone users are placed into pending state until the PBX call confirms them.
-7. Room/surname users are checked against the configured PMS source.
-8. Accepted users receive RADIUS attributes and get internet access.
-9. FreeRADIUS forwards accounting events to `/radius-accounting`.
+1. Гость подключается к MikroTik Hotspot.
+2. MikroTik отправляет запрос в FreeRADIUS.
+3. FreeRADIUS вызывает endpoint портала `/radius-check`.
+4. Портал определяет объект по IP, подсети, VLAN и настройкам сети.
+5. Уже известные активные сессии и MAC-адреса пропускаются сразу.
+6. Гость по телефону попадает в ожидание подтверждающего звонка.
+7. Гость по комнате и фамилии проверяется через настроенный PMS-источник.
+8. При успешной проверке портал возвращает RADIUS-ответ на разрешение доступа.
+9. FreeRADIUS отправляет accounting-события в `/radius-accounting`.
 
-## Integrations
+## Интеграции
 
 ### MikroTik
 
-MikroTik should use FreeRADIUS as the Hotspot RADIUS server. The shared secret
-is generated during install and saved in `setup-summary.txt`.
+MikroTik должен использовать FreeRADIUS как RADIUS-сервер для Hotspot. Shared
+secret генерируется во время установки и сохраняется в `setup-summary.txt`.
 
-Configure the guest networks in the admin UI under `Система -> Сети`. The portal
-uses those mappings to understand which hotel/object the guest belongs to.
+Гостевые сети настраиваются в админке: `Система -> Сети`. Именно эти настройки
+портал использует, чтобы понять, к какому объекту относится гость.
 
 ### FreeRADIUS
 
-On first install, `setup.sh` can install and configure FreeRADIUS with:
+При первой установке `setup.sh` может установить и настроить FreeRADIUS:
 
-- UDP `1812` for authentication.
-- UDP `1813` for accounting.
-- REST bridge to `http://127.0.0.1:8080/radius-check`.
-- Accounting forwarder to `http://127.0.0.1:8080/radius-accounting`.
+- UDP `1812` для авторизации.
+- UDP `1813` для accounting.
+- REST-мост к `http://127.0.0.1:8080/radius-check`.
+- Accounting-forwarder к `http://127.0.0.1:8080/radius-accounting`.
 
-During `--upgrade`, FreeRADIUS is skipped unless `--with-radius` is passed.
+При `--upgrade` FreeRADIUS пропускается, если явно не передать `--with-radius`.
 
 ### PBX / Asterisk
 
-PBX callback verification is configured in the UI. Keep the PBX endpoint
-restricted by allowed IPs.
+Подтверждение звонком настраивается в UI. Endpoint PBX нужно ограничивать по
+разрешенным IP-адресам.
 
 ### 1C / PMS
 
-1C/PMS objects are configured in the UI. The portal sends room/surname data to
-the configured API and uses the response to accept or reject the guest.
+Объекты 1C/PMS настраиваются в UI. Портал отправляет номер комнаты и фамилию в
+настроенный API и принимает решение по ответу PMS.
 
 ### Opera / FIAS
 
-Opera/FIAS objects are configured in the UI. The portal can use a local
-`opera_stays.db` cache for room/surname lookup. The FIAS listener/collector is
-deployment-specific and should be managed carefully on production systems.
+Объекты Opera/FIAS настраиваются в UI. Для проверки комнаты и фамилии портал
+может использовать локальную базу `opera_stays.db`. FIAS listener/collector
+зависит от конкретного внедрения и требует аккуратного сопровождения на бою.
 
-## Services
+## Сервисы
 
-The standard install manages:
+Стандартная установка управляет:
 
 ```text
 hotspot-captive-portal.service
@@ -161,48 +163,49 @@ hotspot-mikrotik-sync-worker.service
 freeradius.service
 ```
 
-Some deployments also run:
+В некоторых внедрениях дополнительно используется:
 
 ```text
 opera-fias-sync.service
 ```
 
-Check status:
+Проверить статус:
 
 ```bash
 systemctl status hotspot-captive-portal.service --no-pager
 systemctl status freeradius.service --no-pager
 ```
 
-Watch logs:
+Смотреть лог:
 
 ```bash
 journalctl -u hotspot-captive-portal.service -f
 ```
 
-The admin UI also has `Система -> Сервис`, which shows readiness checks and live
-service status.
+В админке есть раздел `Система -> Сервис`: там видны проверки готовности,
+состояние сервисов, нагрузка и логи.
 
-## Production Safety
+## Безопасная работа на production
 
-Do not run a fresh install directly over an existing production directory unless
-you know exactly what will be replaced.
+Не запускайте чистую установку поверх существующего production-каталога, если
+точно не понимаете, какие файлы будут заменены.
 
-For non-Git legacy deployments, use a blue/green migration:
+Для старых установок без нормальной Git-привязки лучше использовать
+blue/green-миграцию:
 
-1. Keep the old portal running.
-2. Clone the Git version into a new directory.
-3. Copy `.env` and data into the new directory.
-4. Run the new portal on a temporary port.
-5. Verify admin UI, PMS settings, networks, and service readiness.
-6. Stop authorization traffic or put MikroTik into a temporary bypass mode.
-7. Stop the portal, copy the final SQLite database, switch systemd, and start.
-8. Keep the old directory as rollback until the new version is proven.
+1. Оставить старый портал работающим.
+2. Склонировать Git-версию в новый каталог.
+3. Перенести `.env` и данные в новый каталог.
+4. Запустить новую копию на временном порту.
+5. Проверить админку, сети, PMS-настройки и готовность сервисов.
+6. На время финального переключения отключить авторизацию или включить bypass на MikroTik.
+7. Остановить портал, скопировать финальную SQLite-базу, переключить systemd и запустить.
+8. Старый каталог оставить как rollback, пока новая версия не будет проверена.
 
-SQLite databases can be large and busy on production systems. For an exact final
-copy, stop the portal and workers before copying the database.
+SQLite-база на production может быть большой и постоянно записываться. Для
+точной финальной копии остановите портал и воркеры перед копированием базы.
 
-## Local Development
+## Локальная разработка
 
 ```bash
 python3 -m venv .venv
@@ -211,37 +214,37 @@ pip install -r requirements.txt
 python -m uvicorn app:app --reload --host 127.0.0.1 --port 8080
 ```
 
-Run smoke checks:
+Запуск smoke-check:
 
 ```bash
 python tools/smoke_check.py --strict-secrets
 ```
 
-## Repository Layout
+## Структура проекта
 
 ```text
-app.py                  Main FastAPI app and admin routes
-db.py                   SQLite schema and connection helpers
-services.py             Auth/session/audit business logic
-admin_auth.py           Admin users and sessions
-app_services/           Settings, 1C/PMS, Opera/FIAS stores
-integrations/           External lookup helpers
-workers/                Cleanup and MikroTik sync workers
+app.py                  Основное FastAPI-приложение и admin routes
+db.py                   SQLite-схема и helpers подключения
+services.py             Бизнес-логика авторизации, сессий и аудита
+admin_auth.py           Пользователи и сессии админки
+app_services/           Настройки, 1C/PMS, Opera/FIAS stores
+integrations/           Helpers внешних интеграций
+workers/                Cleanup и MikroTik sync workers
 scripts/                FreeRADIUS accounting forwarder
-tools/smoke_check.py    Basic safety checks
-static/                 Admin UI assets
-setup.sh                Installer and upgrader
+tools/smoke_check.py    Базовые проверки безопасности и маршрутов
+static/                 Статика админки
+setup.sh                Установщик и обновлятор
 ```
 
-## Roadmap
+## План развития
 
-- Split `app.py` into smaller modules.
-- Improve first-run UI and reduce terminal configuration.
-- Move production data paths toward a dedicated data directory.
-- Improve backup/restore tooling.
-- Expand readiness checks and PMS diagnostics.
-- Document MikroTik, FreeRADIUS, PBX, 1C, and Opera/FIAS setup in detail.
+- Разнести `app.py` на небольшие модули.
+- Улучшить первый запуск и уменьшить необходимость работы с терминалом.
+- Перенести production-данные в отдельный data-каталог.
+- Добавить понятные backup/restore-инструменты.
+- Расширить readiness checks и диагностику PMS.
+- Подробно документировать MikroTik, FreeRADIUS, PBX, 1C и Opera/FIAS.
 
-## License
+## Лицензия
 
-License is not declared yet.
+Лицензия пока не указана.
