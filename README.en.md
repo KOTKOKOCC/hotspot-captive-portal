@@ -247,4 +247,4 @@ setup.sh                Installer and upgrader
 
 ## License
 
-License is not declared yet.
+This project is licensed under the [MIT License](LICENSE).
