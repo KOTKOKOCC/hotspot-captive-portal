@@ -155,6 +155,20 @@ detect_server_host() {
   printf '%s' "$host"
 }
 
+read_app_version() {
+  local version=""
+
+  if [ -f "$PROJECT_DIR/VERSION" ]; then
+    version=$(head -n 1 "$PROJECT_DIR/VERSION" | tr -d '[:space:]')
+  fi
+
+  if [ -z "$version" ]; then
+    version="0.9.1"
+  fi
+
+  printf '%s' "$version"
+}
+
 write_setup_summary() {
   local summary_file="$PROJECT_DIR/setup-summary.txt"
   local server_host
@@ -162,8 +176,10 @@ write_setup_summary() {
   local admin_password
   local radius_clients
   local radius_secret
+  local app_version
 
   server_host=$(detect_server_host)
+  app_version=$(read_app_version)
   admin_username=$(read_env_value "ADMIN_USERNAME" "$ADMIN_USERNAME_VAL")
   admin_password=$(read_env_value "ADMIN_PASSWORD" "")
   radius_clients=$(read_env_value "RADIUS_CLIENTS" "$RADIUS_CLIENTS_DEFAULT")
@@ -171,6 +187,7 @@ write_setup_summary() {
 
   {
     echo "Hotspot Captive Portal setup summary"
+    echo "Version: $app_version"
     echo "Generated at: $(date -Is 2>/dev/null || date)"
     echo
     echo "Admin panel:"
@@ -312,7 +329,7 @@ ensure_runtime_env_defaults() {
 check_required_files() {
   local missing=""
 
-  for path in app.py requirements.txt admin_auth.py db.py tools/smoke_check.py workers/cleanup_worker.py workers/mikrotik_sync_worker.py; do
+  for path in VERSION app.py requirements.txt admin_auth.py db.py tools/smoke_check.py workers/cleanup_worker.py workers/mikrotik_sync_worker.py; do
     if [ ! -e "$path" ]; then
       missing="$missing $path"
     fi

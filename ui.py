@@ -4,6 +4,7 @@ from urllib.parse import quote_plus
 
 from fastapi.responses import HTMLResponse
 
+from config import APP_VERSION
 from labels import (
     COLUMN_LABELS,
     EVENT_LABELS,
@@ -228,11 +229,14 @@ def admin_page(title: str, body: str, active_tab: str = "", role: str = "admin")
           </div>
         </div>
       </div>
+      <div class="watermark" aria-hidden="true">
+        <div>Created by S.Z.</div>
+        <div class="watermark-version">v{escape(APP_VERSION)}</div>
+      </div>
     </body>
     </html>
     """
     return HTMLResponse(html)
-
 
 
 

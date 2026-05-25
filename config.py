@@ -20,7 +20,18 @@ PBX_ALLOWED_IPS = [
     if ip.strip()
 ]
 
+
+def _read_app_version() -> str:
+    try:
+        version = (BASE_DIR / "VERSION").read_text(encoding="utf-8").strip()
+    except OSError:
+        version = "0.9.1"
+
+    return version or "0.9.1"
+
+
 APP_NAME = os.getenv("APP_NAME", "C-Portal")
+APP_VERSION = os.getenv("APP_VERSION", _read_app_version())
 DB_PATH = os.getenv("DB_PATH", str(BASE_DIR / "hotspot.db"))
 OPERA_CACHE_DB_PATH = os.getenv(
     "OPERA_CACHE_DB_PATH",
