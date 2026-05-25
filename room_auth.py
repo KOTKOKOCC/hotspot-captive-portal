@@ -24,6 +24,7 @@ def ensure_room_auth_table():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_room_auth_mac ON room_auth(mac)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_room_auth_ip ON room_auth(ip)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_room_auth_room_surname ON room_auth(room_num, surname_norm)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_room_auth_created_at ON room_auth(created_at)")
     conn.commit()
     conn.close()
 

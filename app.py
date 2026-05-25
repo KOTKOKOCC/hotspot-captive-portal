@@ -111,6 +111,10 @@ from admin_auth import (
 
 from services import (
     DISPLAY_TZ,
+    MIN_RETENTION_DAYS,
+    DEFAULT_RETENTION_DAYS,
+    DEFAULT_RETENTION_BATCH_SIZE,
+    get_retention_config,
     normalize_accounting_event_time,
     resolve_network_info,
     audit,
@@ -181,6 +185,12 @@ def csv_setting_items(key: str, default_items: tuple[str, ...] | list[str] = ())
 def ensure_security_default_settings() -> None:
     if get_setting("radius.allowed_ips", None) is None:
         set_setting("radius.allowed_ips", ",".join(DEFAULT_RADIUS_ALLOWED_IPS))
+    if get_setting("retention.enabled", None) is None:
+        set_setting("retention.enabled", "1")
+    if get_setting("retention.days", None) is None:
+        set_setting("retention.days", DEFAULT_RETENTION_DAYS)
+    if get_setting("retention.batch_size", None) is None:
+        set_setting("retention.batch_size", DEFAULT_RETENTION_BATCH_SIZE)
 
 
 def mask_phone(phone: str | None) -> str:
@@ -365,6 +375,7 @@ def build_readiness_rows(service_statuses: dict[str, str]) -> str:
     radius_allowed_ips = csv_setting_items("radius.allowed_ips", DEFAULT_RADIUS_ALLOWED_IPS)
     pbx_enabled = str(get_setting("pbx.enabled", "1")) == "1"
     pbx_allowed_ips = csv_setting_items("pbx.allowed_ips", PBX_ALLOWED_IPS)
+    retention_config = get_retention_config()
 
     last_radius = get_last_radius_event()
     opera_status = get_opera_fias_status()
@@ -420,6 +431,14 @@ def build_readiness_rows(service_statuses: dict[str, str]) -> str:
         "PMS objects",
         "ok" if (onec_active + opera_active) > 0 else "warn",
         f"1C active: {onec_active}, Opera active: {opera_active}",
+        "/admin/system?section=settings",
+    )
+    add(
+        "Data retention",
+        "ok" if retention_config["enabled"] and retention_config["days"] >= MIN_RETENTION_DAYS else "warn",
+        f"enabled, {retention_config['days']} days"
+        if retention_config["enabled"]
+        else "disabled",
         "/admin/system?section=settings",
     )
     add(
@@ -878,6 +897,10 @@ def build_settings_body(ok: str = "", pms_check: dict | None = None):
     pms_allowed_ips = str(get_setting("pms_api.allowed_ips", ""))
     pms_token_is_set = bool(str(get_setting("pms_api.token", "") or "").strip())
     pms_token_placeholder = "Токен задан" if pms_token_is_set else "Новый токен"
+    retention_config = get_retention_config()
+    retention_enabled = retention_config["enabled"]
+    retention_days = retention_config["days"]
+    retention_batch_size = retention_config["batch_size"]
 
     pms_check = pms_check or {}
     pms_check_hotel = str(pms_check.get("hotel") or "")
@@ -1027,6 +1050,44 @@ def build_settings_body(ok: str = "", pms_check: dict | None = None):
 
             <div class="settings-field" style="align-self:end;">
               <button type="submit" class="btn btn-primary">Сохранить PMS API</button>
+            </div>
+          </div>
+        </form>
+      </div>
+
+
+      <div class="settings-card">
+        <form method="post" action="/admin/settings/retention">
+          <h3 style="margin:0 0 12px;">Хранение данных</h3>
+
+          <div class="settings-grid settings-grid-pbx">
+            <div class="settings-field">
+              <label>Включено</label>
+              <select name="retention_enabled">
+                <option value="1" {"selected" if retention_enabled else ""}>Да</option>
+                <option value="0" {"" if retention_enabled else "selected"}>Нет</option>
+              </select>
+            </div>
+
+            <div class="settings-field">
+              <label>Срок, дней (мин. {MIN_RETENTION_DAYS})</label>
+              <input type="number"
+                   name="retention_days"
+                   min="{MIN_RETENTION_DAYS}"
+                   value="{retention_days}">
+            </div>
+
+            <div class="settings-field">
+              <label>Размер пачки</label>
+              <input type="number"
+                   name="retention_batch_size"
+                   min="100"
+                   max="50000"
+                   value="{retention_batch_size}">
+            </div>
+
+            <div class="settings-field" style="align-self:end;">
+              <button type="submit" class="btn btn-primary">Сохранить хранение</button>
             </div>
           </div>
         </form>
@@ -1316,6 +1377,27 @@ def admin_settings_pms_api(
         set_setting("pms_api.token", pms_api_token.strip(), is_secret=True)
 
     return RedirectResponse(url="/admin/system?section=settings&ok=pms_api", status_code=303)
+
+
+@app.post("/admin/settings/retention")
+def admin_settings_retention(
+    request: Request,
+    retention_enabled: str = Form("0"),
+    retention_days: int = Form(DEFAULT_RETENTION_DAYS),
+    retention_batch_size: int = Form(DEFAULT_RETENTION_BATCH_SIZE),
+):
+    guard = role_guard(request, ("superadmin",))
+    if guard:
+        return guard
+
+    retention_days = max(MIN_RETENTION_DAYS, min(3650, int(retention_days)))
+    retention_batch_size = max(100, min(50000, int(retention_batch_size)))
+
+    set_setting("retention.enabled", "1" if retention_enabled == "1" else "0")
+    set_setting("retention.days", retention_days)
+    set_setting("retention.batch_size", retention_batch_size)
+
+    return RedirectResponse(url="/admin/system?section=settings&ok=retention", status_code=303)
 
 
 @app.post("/admin/settings/pms-check", response_class=HTMLResponse)

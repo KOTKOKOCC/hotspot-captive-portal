@@ -495,6 +495,128 @@ def check_pms_check_result_renderer() -> None:
     ok("PMS check renderer explains found, not found, and config states")
 
 
+def check_retention_cleanup() -> None:
+    import tempfile
+    from datetime import datetime, timedelta, timezone
+
+    import db as db_module
+    import app_services.settings_store as settings_store
+    import services
+    from app_services.settings_store import get_setting, set_setting
+    from db import init_db
+    from room_auth import ensure_room_auth_table
+
+    original_db_path = db_module.DB_PATH
+    original_settings_db_path = settings_store.DB_PATH
+
+    old_ts = (datetime.now(timezone.utc) - timedelta(days=181)).isoformat()
+    recent_ts = (datetime.now(timezone.utc) - timedelta(days=120)).isoformat()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        test_db = Path(tmp) / "retention.db"
+        db_module.DB_PATH = str(test_db)
+        settings_store.DB_PATH = str(test_db)
+
+        try:
+            init_db()
+            ensure_room_auth_table()
+            set_setting("retention.enabled", "1")
+            set_setting("retention.days", 30)
+            set_setting("retention.batch_size", 1000)
+            set_setting("retention.last_run", "")
+
+            conn = db_module.db()
+            conn.execute("""
+                INSERT INTO pending_auth
+                (phone, mac, ip, nas_id, hotel, ssid, vlan_id, created_at, expires_at, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, ("79990000181", "AA:BB:CC:DD:EE:01", "10.0.0.1", "nas", "hotel", "ssid", "1", old_ts, old_ts, "expired"))
+            conn.execute("""
+                INSERT INTO pending_auth
+                (phone, mac, ip, nas_id, hotel, ssid, vlan_id, created_at, expires_at, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, ("79990000120", "AA:BB:CC:DD:EE:02", "10.0.0.2", "nas", "hotel", "ssid", "1", recent_ts, recent_ts, "expired"))
+            conn.execute("""
+                INSERT INTO call_events (phone, callerid_raw, source_ip, created_at, result)
+                VALUES (?, ?, ?, ?, ?)
+            """, ("79990000181", "79990000181", "10.0.0.1", old_ts, "smoke_old"))
+            conn.execute("""
+                INSERT INTO call_events (phone, callerid_raw, source_ip, created_at, result)
+                VALUES (?, ?, ?, ?, ?)
+            """, ("79990000120", "79990000120", "10.0.0.2", recent_ts, "smoke_recent"))
+            conn.execute("""
+                INSERT INTO audit_log (phone, mac, ip, nas_id, hotel, ssid, vlan_id, event_type, event_time, details)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, ("79990000181", "AA:BB:CC:DD:EE:01", "10.0.0.1", "nas", "hotel", "ssid", "1", "smoke_old", old_ts, "old"))
+            conn.execute("""
+                INSERT INTO audit_log (phone, mac, ip, nas_id, hotel, ssid, vlan_id, event_type, event_time, details)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, ("79990000120", "AA:BB:CC:DD:EE:02", "10.0.0.2", "nas", "hotel", "ssid", "1", "smoke_recent", recent_ts, "recent"))
+            conn.execute("""
+                INSERT INTO radius_accounting
+                (acct_session_id, username, mac, ip, nas_ip, nas_id, nas_port_id, called_station_id, acct_status_type, event_time, raw_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, ("smoke-old", "79990000181", "AA:BB:CC:DD:EE:01", "10.0.0.1", "10.0.0.254", "nas", "port", "ssid", "Stop", old_ts, "{}", old_ts))
+            conn.execute("""
+                INSERT INTO radius_accounting
+                (acct_session_id, username, mac, ip, nas_ip, nas_id, nas_port_id, called_station_id, acct_status_type, event_time, raw_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, ("smoke-recent", "79990000120", "AA:BB:CC:DD:EE:02", "10.0.0.2", "10.0.0.254", "nas", "port", "ssid", "Stop", recent_ts, "{}", recent_ts))
+            conn.execute("""
+                INSERT INTO guest_sessions
+                (phone, mac, ip, nas_id, hotel, ssid, vlan_id, started_at, last_seen_at, ended_at, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, ("79990000181", "AA:BB:CC:DD:EE:01", "10.0.0.1", "nas", "hotel", "ssid", "1", old_ts, old_ts, old_ts, "closed"))
+            conn.execute("""
+                INSERT INTO guest_sessions
+                (phone, mac, ip, nas_id, hotel, ssid, vlan_id, started_at, last_seen_at, ended_at, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, ("79990000120", "AA:BB:CC:DD:EE:02", "10.0.0.2", "nas", "hotel", "ssid", "1", recent_ts, recent_ts, recent_ts, "closed"))
+            conn.execute("""
+                INSERT INTO room_auth (room_num, surname, surname_norm, mac, ip, nas_id, hotel, status, expires_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, ("101", "Old", "old", "AA:BB:CC:DD:EE:01", "10.0.0.1", "nas", "hotel", "verified", old_ts, old_ts))
+            conn.execute("""
+                INSERT INTO room_auth (room_num, surname, surname_norm, mac, ip, nas_id, hotel, status, expires_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, ("102", "Recent", "recent", "AA:BB:CC:DD:EE:02", "10.0.0.2", "nas", "hotel", "verified", recent_ts, recent_ts))
+            conn.commit()
+            conn.close()
+
+            result = services.run_retention_cleanup(force=True)
+            if result.get("deleted") != 6:
+                fail(f"retention cleanup should delete only 6 old rows, got {result}")
+            if int(get_setting("retention.days", 0)) != 30:
+                fail("retention test setup did not store a low raw value")
+            if services.get_retention_config()["days"] != services.MIN_RETENTION_DAYS:
+                fail("retention cleanup did not clamp retention days to the legal minimum")
+
+            conn = db_module.db()
+            checks = [
+                ("pending_auth", "phone"),
+                ("call_events", "phone"),
+                ("audit_log", "phone"),
+                ("radius_accounting", "username"),
+                ("guest_sessions", "phone"),
+                ("room_auth", "surname_norm"),
+            ]
+            for table, column in checks:
+                old_count = conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE {column} IN ('79990000181', 'old')"
+                ).fetchone()[0]
+                recent_count = conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE {column} IN ('79990000120', 'recent')"
+                ).fetchone()[0]
+                if old_count != 0 or recent_count != 1:
+                    fail(f"retention cleanup mismatch for {table}: old={old_count}, recent={recent_count}")
+            conn.close()
+        finally:
+            db_module.DB_PATH = original_db_path
+            settings_store.DB_PATH = original_settings_db_path
+
+    ok("retention cleanup keeps at least 180 days and deletes older personal records")
+
+
 def fetch_no_redirect(url: str):
     opener = urllib.request.build_opener(NoRedirect)
     request = urllib.request.Request(url, method="GET")
@@ -535,6 +657,7 @@ def main() -> None:
     check_pms_api_guard_settings()
     check_legacy_dusit_routes_use_pms_router()
     check_pms_check_result_renderer()
+    check_retention_cleanup()
 
     if args.base_url:
         check_http(args.base_url)

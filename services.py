@@ -8,10 +8,16 @@ import logging
 
 from db import db
 from auth import now, now_iso, normalize_phone, normalize_mac
+from app_services.settings_store import get_setting, set_setting
 
 DISPLAY_TZ = ZoneInfo("Europe/Moscow")
 
 logger = logging.getLogger(__name__)
+
+MIN_RETENTION_DAYS = 180
+DEFAULT_RETENTION_DAYS = 180
+DEFAULT_RETENTION_BATCH_SIZE = 5000
+DEFAULT_RETENTION_INTERVAL_HOURS = 24
 
 
 TERMINATE_CAUSE_ALIASES = {
@@ -412,6 +418,179 @@ def start_cleanup_worker(interval_seconds: int = 60):
         _cleanup_worker_started = True
 
 
+def _int_setting(key: str, default: int, minimum: int | None = None, maximum: int | None = None) -> int:
+    try:
+        value = int(get_setting(key, default))
+    except Exception:
+        value = default
+
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+
+    return value
+
+
+def get_retention_config() -> dict:
+    return {
+        "enabled": str(get_setting("retention.enabled", "1")) == "1",
+        "days": _int_setting(
+            "retention.days",
+            DEFAULT_RETENTION_DAYS,
+            minimum=MIN_RETENTION_DAYS,
+            maximum=3650,
+        ),
+        "batch_size": _int_setting(
+            "retention.batch_size",
+            DEFAULT_RETENTION_BATCH_SIZE,
+            minimum=100,
+            maximum=50000,
+        ),
+        "interval_hours": _int_setting(
+            "retention.interval_hours",
+            DEFAULT_RETENTION_INTERVAL_HOURS,
+            minimum=1,
+            maximum=168,
+        ),
+        "last_run": str(get_setting("retention.last_run", "") or ""),
+    }
+
+
+def _parse_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except Exception:
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+
+    return parsed
+
+
+def _retention_due(last_run: str, interval_hours: int) -> bool:
+    parsed = _parse_dt(last_run)
+    if parsed is None:
+        return True
+
+    return now() - parsed >= timedelta(hours=interval_hours)
+
+
+def _table_exists(conn, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def _delete_old_batch(conn, table: str, timestamp_expr: str, cutoff_iso: str, batch_size: int, extra_where: str = "") -> int:
+    if not _table_exists(conn, table):
+        return 0
+
+    where_parts = []
+    if extra_where:
+        where_parts.append(f"({extra_where})")
+    where_parts.append(f"{timestamp_expr} < ?")
+    where_clause = " AND ".join(where_parts)
+
+    cur = conn.execute(f"""
+        DELETE FROM {table}
+        WHERE id IN (
+            SELECT id
+            FROM {table}
+            WHERE {where_clause}
+            ORDER BY id
+            LIMIT ?
+        )
+    """, (cutoff_iso, batch_size))
+
+    return max(cur.rowcount or 0, 0)
+
+
+def run_retention_cleanup(force: bool = False) -> dict:
+    config = get_retention_config()
+    if not config["enabled"] and not force:
+        return {"ran": False, "deleted": 0}
+
+    if not force and not _retention_due(config["last_run"], config["interval_hours"]):
+        return {"ran": False, "deleted": 0}
+
+    cutoff_iso = (now() - timedelta(days=config["days"])).isoformat()
+    batch_size = config["batch_size"]
+    stats = {
+        "pending_auth": 0,
+        "call_events": 0,
+        "audit_log": 0,
+        "radius_accounting": 0,
+        "guest_sessions": 0,
+        "room_auth": 0,
+    }
+
+    conn = db()
+    try:
+        stats["pending_auth"] = _delete_old_batch(
+            conn,
+            "pending_auth",
+            "COALESCE(created_at, expires_at)",
+            cutoff_iso,
+            batch_size,
+        )
+        stats["call_events"] = _delete_old_batch(
+            conn,
+            "call_events",
+            "created_at",
+            cutoff_iso,
+            batch_size,
+        )
+        stats["audit_log"] = _delete_old_batch(
+            conn,
+            "audit_log",
+            "event_time",
+            cutoff_iso,
+            batch_size,
+        )
+        stats["radius_accounting"] = _delete_old_batch(
+            conn,
+            "radius_accounting",
+            "event_time",
+            cutoff_iso,
+            batch_size,
+        )
+        stats["guest_sessions"] = _delete_old_batch(
+            conn,
+            "guest_sessions",
+            "COALESCE(ended_at, last_seen_at, started_at)",
+            cutoff_iso,
+            batch_size,
+            "status != 'active'",
+        )
+        stats["room_auth"] = _delete_old_batch(
+            conn,
+            "room_auth",
+            "COALESCE(created_at, expires_at)",
+            cutoff_iso,
+            batch_size,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    set_setting("retention.last_run", now_iso())
+
+    total_deleted = sum(stats.values())
+    return {
+        "ran": True,
+        "deleted": total_deleted,
+        "cutoff": cutoff_iso,
+        "tables": stats,
+    }
+
+
 def cleanup_db():
     conn = db()
     current = now()
@@ -436,12 +615,6 @@ def cleanup_db():
 
         if row["status"] == "pending" and current > exp:
             to_expire.append(row["id"])
-
-        elif row["status"] == "expired" and current > exp + timedelta(days=1):
-            to_delete.append(row["id"])
-
-        elif row["status"] == "verified" and current > exp + timedelta(days=3):
-            to_delete.append(row["id"])
 
     expired = 0
     deleted = 0
@@ -513,10 +686,13 @@ def cleanup_stale_sessions():
 def run_cleanup():
     pending_stats = cleanup_db()
     stale_sessions_closed = cleanup_stale_sessions()
+    retention_stats = run_retention_cleanup()
     return {
         "pending_expired": pending_stats["expired"],
         "pending_deleted": pending_stats["deleted"],
         "stale_sessions_closed": stale_sessions_closed,
+        "retention_checked": 1 if retention_stats.get("ran") else 0,
+        "retention_deleted": int(retention_stats.get("deleted") or 0),
     }
 
 
@@ -541,5 +717,3 @@ def accept_reply():
         "Mikrotik-Group": "guest_default",
         "Session-Timeout": "259200"
     }
-
-

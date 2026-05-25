@@ -162,11 +162,14 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_pending_auth_phone ON pending_auth(phone)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_pending_auth_status ON pending_auth(status)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_pending_auth_mac ON pending_auth(mac)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pending_auth_created_at ON pending_auth(created_at)")
 
     cur.execute("CREATE INDEX IF NOT EXISTS idx_guest_sessions_phone ON guest_sessions(phone)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_guest_sessions_mac ON guest_sessions(mac)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_guest_sessions_status ON guest_sessions(status)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_guest_sessions_started_at ON guest_sessions(started_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_guest_sessions_last_seen_at ON guest_sessions(last_seen_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_guest_sessions_ended_at ON guest_sessions(ended_at)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_guest_sessions_acct_session_id ON guest_sessions(acct_session_id)")
 
     cur.execute("CREATE INDEX IF NOT EXISTS idx_call_events_phone ON call_events(phone)")
