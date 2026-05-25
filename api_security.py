@@ -56,3 +56,18 @@ def optional_api_guard(
 
     if not hmac.compare_digest(supplied, token):
         raise HTTPException(status_code=403, detail="forbidden_token")
+
+
+def require_api_guard(
+    request: Request,
+    token: str = "",
+    allowed_ips: list[str] | tuple[str, ...] = (),
+    not_configured_detail: str = "api_guard_not_configured",
+) -> None:
+    token = (token or "").strip()
+    allowed_ips = tuple(ip for ip in allowed_ips if ip)
+
+    if not token and not allowed_ips:
+        raise HTTPException(status_code=403, detail=not_configured_detail)
+
+    optional_api_guard(request, token=token, allowed_ips=allowed_ips)

@@ -94,7 +94,7 @@ from config import (
     PBX_ALLOWED_IPS,
 )
 
-from api_security import optional_api_guard
+from api_security import ip_allowed, require_api_guard
 
 from admin_auth import (
     make_admin_token,
@@ -160,6 +160,27 @@ from logging_config import setup_logging
 setup_logging()
 logger = logging.getLogger(__name__)
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_RADIUS_ALLOWED_IPS = ("127.0.0.1", "::1")
+
+
+def split_csv_items(value) -> list[str]:
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    return [
+        item.strip()
+        for item in str(value or "").split(",")
+        if item.strip()
+    ]
+
+
+def csv_setting_items(key: str, default_items: tuple[str, ...] | list[str] = ()) -> list[str]:
+    return split_csv_items(get_setting(key, ",".join(default_items)))
+
+
+def ensure_security_default_settings() -> None:
+    if get_setting("radius.allowed_ips", None) is None:
+        set_setting("radius.allowed_ips", ",".join(DEFAULT_RADIUS_ALLOWED_IPS))
 
 
 def mask_phone(phone: str | None) -> str:
@@ -341,8 +362,9 @@ def build_readiness_rows(service_statuses: dict[str, str]) -> str:
     onec_active = sum(1 for site in onec_sites if site.get("enabled"))
     opera_active = sum(1 for site in opera_sites if site.get("enabled"))
 
+    radius_allowed_ips = csv_setting_items("radius.allowed_ips", DEFAULT_RADIUS_ALLOWED_IPS)
     pbx_enabled = str(get_setting("pbx.enabled", "1")) == "1"
-    pbx_allowed_ips = str(get_setting("pbx.allowed_ips", ",".join(PBX_ALLOWED_IPS)) or "").strip()
+    pbx_allowed_ips = csv_setting_items("pbx.allowed_ips", PBX_ALLOWED_IPS)
 
     last_radius = get_last_radius_event()
     opera_status = get_opera_fias_status()
@@ -376,6 +398,14 @@ def build_readiness_rows(service_statuses: dict[str, str]) -> str:
         "host, user and password configured"
         if mt_host and mt_user and mt_password
         else "not fully configured",
+        "/admin/system?section=settings",
+    )
+    add(
+        "RADIUS API guard",
+        "ok" if radius_allowed_ips else "bad",
+        "allowed IPs: " + ", ".join(radius_allowed_ips)
+        if radius_allowed_ips
+        else "allowed IPs are empty",
         "/admin/system?section=settings",
     )
     add(
@@ -521,17 +551,51 @@ def pms_api_guard(request: Request) -> None:
         return
 
     token = str(get_setting("pms_api.token", "") or "").strip()
-    allowed_ips_raw = str(get_setting("pms_api.allowed_ips", "") or "")
-    allowed_ips = [
-        ip.strip()
-        for ip in allowed_ips_raw.split(",")
-        if ip.strip()
-    ]
+    allowed_ips = csv_setting_items("pms_api.allowed_ips")
 
-    if not token and not allowed_ips:
-        raise HTTPException(status_code=403, detail="pms_api_guard_not_configured")
+    require_api_guard(
+        request,
+        token=token,
+        allowed_ips=allowed_ips,
+        not_configured_detail="pms_api_guard_not_configured",
+    )
 
-    optional_api_guard(request, token=token, allowed_ips=allowed_ips)
+
+def radius_api_guard(request: Request) -> None:
+    client_ip = request.client.host if request.client else ""
+    allowed_ips = csv_setting_items("radius.allowed_ips", DEFAULT_RADIUS_ALLOWED_IPS)
+
+    try:
+        require_api_guard(
+            request,
+            allowed_ips=allowed_ips,
+            not_configured_detail="radius_guard_not_configured",
+        )
+    except HTTPException as exc:
+        audit(
+            "radius_api_forbidden",
+            ip=client_ip,
+            details=f"RADIUS API rejected: {exc.detail}",
+        )
+        raise
+
+
+def pbx_api_guard(request: Request) -> None:
+    client_ip = request.client.host if request.client else ""
+    pbx_enabled = str(get_setting("pbx.enabled", "1")) == "1"
+    pbx_allowed_ips = csv_setting_items("pbx.allowed_ips", PBX_ALLOWED_IPS)
+
+    if not pbx_enabled:
+        audit("pbx_disabled", ip=client_ip, details="PBX call rejected because PBX is disabled")
+        raise HTTPException(status_code=403, detail="pbx disabled")
+
+    if not pbx_allowed_ips:
+        audit("pbx_not_configured", ip=client_ip, details="PBX call rejected because allowed IPs are empty")
+        raise HTTPException(status_code=403, detail="pbx_guard_not_configured")
+
+    if not ip_allowed(client_ip, pbx_allowed_ips):
+        audit("pbx_forbidden_ip", ip=client_ip, details="PBX call rejected by IP allowlist")
+        raise HTTPException(status_code=403, detail="pbx ip forbidden")
 
 _ONEC_STATUS_CACHE = {}
 
@@ -806,6 +870,7 @@ def build_settings_body(ok: str = "", pms_check: dict | None = None):
       </div>
     """
 
+    radius_allowed_ips = str(get_setting("radius.allowed_ips", ",".join(DEFAULT_RADIUS_ALLOWED_IPS)))
     pbx_enabled = str(get_setting("pbx.enabled", "1")) == "1"
     pbx_allowed_ips = str(get_setting("pbx.allowed_ips", ",".join(PBX_ALLOWED_IPS)))
 
@@ -875,6 +940,27 @@ def build_settings_body(ok: str = "", pms_check: dict | None = None):
 
             <div class="settings-field" style="align-self:end;">
               <button type="submit" class="btn btn-primary">Сохранить MikroTik</button>
+            </div>
+          </div>
+        </form>
+      </div>
+
+
+      <div class="settings-card">
+        <form method="post" action="/admin/settings/radius-api">
+          <h3 style="margin:0 0 12px;">RADIUS / FreeRADIUS</h3>
+
+          <div class="settings-grid settings-grid-pbx">
+            <div class="settings-field">
+              <label>Разрешённые IP / CIDR</label>
+              <input type="text"
+                   name="radius_allowed_ips"
+                   value="{escape(radius_allowed_ips)}"
+                   placeholder="127.0.0.1,::1">
+            </div>
+
+            <div class="settings-field" style="align-self:end;">
+              <button type="submit" class="btn btn-primary">Сохранить RADIUS</button>
             </div>
           </div>
         </form>
@@ -1182,6 +1268,20 @@ def admin_settings_mikrotik_save(
     return RedirectResponse(url="/admin/system?section=settings&ok=1", status_code=303)
 
 
+@app.post("/admin/settings/radius-api")
+def admin_settings_radius_api(
+    request: Request,
+    radius_allowed_ips: str = Form(""),
+):
+    guard = role_guard(request, ("superadmin",))
+    if guard:
+        return guard
+
+    set_setting("radius.allowed_ips", radius_allowed_ips.strip())
+
+    return RedirectResponse(url="/admin/system?section=settings&ok=radius", status_code=303)
+
+
 @app.post("/admin/settings/pbx")
 def admin_settings_pbx(
     request: Request,
@@ -1471,6 +1571,7 @@ def admin_export_period(request: Request, date_from: str | None = None, date_to:
 def startup():
     init_db()
     init_settings_table()
+    ensure_security_default_settings()
     init_onec_sites_table()
     init_opera_sites_table()
     ensure_admin_users_table()
@@ -1486,25 +1587,10 @@ def startup():
 
 @app.post("/pbx-call")
 def pbx_call(request: Request, payload: CallIn):
-    pbx_enabled = str(get_setting("pbx.enabled", "1")) == "1"
-    pbx_allowed_ips_raw = str(get_setting("pbx.allowed_ips", ",".join(PBX_ALLOWED_IPS)))
-    pbx_allowed_ips = [
-        ip.strip()
-        for ip in pbx_allowed_ips_raw.split(",")
-        if ip.strip()
-    ]
-
     client_ip = request.client.host if request.client else ""
+    pbx_api_guard(request)
 
     log_phone_event("PHONE_CALL_RECEIVED", payload.phone, source_ip=client_ip)
-
-    if not pbx_enabled:
-        audit("pbx_disabled", ip=client_ip, details="PBX call rejected because PBX is disabled")
-        raise HTTPException(status_code=403, detail="pbx disabled")
-
-    if pbx_allowed_ips and client_ip not in pbx_allowed_ips:
-        audit("pbx_forbidden_ip", ip=client_ip, details="PBX call rejected by IP allowlist")
-        raise HTTPException(status_code=403, detail="pbx ip forbidden")
 
     try:
         phone = normalize_phone(payload.phone)
@@ -1596,7 +1682,9 @@ def pbx_call(request: Request, payload: CallIn):
 
 
 @app.post("/radius-check")
-def radius_check(payload: RadiusCheckIn):
+def radius_check(request: Request, payload: RadiusCheckIn):
+    radius_api_guard(request)
+
     mac = normalize_mac(payload.mac)
     netinfo = resolve_network_info(payload.ip)
     hotel = netinfo["hotel_name"]
@@ -2151,7 +2239,9 @@ def auth_status(request: Request, phone: str = Query(...)):
 
 
 @app.post("/radius-accounting")
-def radius_accounting(payload: RadiusAccountingIn):
+def radius_accounting(request: Request, payload: RadiusAccountingIn):
+    radius_api_guard(request)
+
     save_radius_accounting(payload)
     return {"status": "ok"}
 

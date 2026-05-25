@@ -191,7 +191,7 @@ def check_opera_lookup_fallback() -> None:
 def check_optional_api_guard() -> None:
     from fastapi import HTTPException
 
-    from api_security import ip_allowed, optional_api_guard
+    from api_security import ip_allowed, optional_api_guard, require_api_guard
 
     class Client:
         def __init__(self, host: str):
@@ -212,6 +212,11 @@ def check_optional_api_guard() -> None:
         fail(message)
 
     optional_api_guard(FakeRequest("10.0.0.5"), token="", allowed_ips=())
+
+    assert_forbidden(
+        lambda: require_api_guard(FakeRequest("10.0.0.5"), token="", allowed_ips=()),
+        "required API guard allowed traffic without token or IP allowlist",
+    )
 
     optional_api_guard(
         FakeRequest("10.0.0.5", {"X-Internal-Token": "secret"}),
@@ -240,6 +245,92 @@ def check_optional_api_guard() -> None:
     )
 
     ok("optional API guard supports token and IP allowlists")
+
+
+def check_internal_api_guards() -> None:
+    from fastapi import HTTPException
+
+    import app as app_module
+
+    class Client:
+        def __init__(self, host: str):
+            self.host = host
+
+    class FakeRequest:
+        def __init__(self, host: str, headers: dict[str, str] | None = None):
+            self.client = Client(host)
+            self.headers = headers or {}
+
+    def assert_forbidden(fn, message: str) -> None:
+        try:
+            fn()
+        except HTTPException as exc:
+            if exc.status_code == 403:
+                return
+            fail(message + f": got status {exc.status_code}")
+        fail(message)
+
+    values = {}
+    original_get_setting = app_module.get_setting
+    original_audit = app_module.audit
+
+    def fake_get_setting(key, default=None):
+        return values.get(key, default)
+
+    def fake_audit(*args, **kwargs):
+        return None
+
+    app_module.get_setting = fake_get_setting
+    app_module.audit = fake_audit
+    try:
+        values.clear()
+        app_module.radius_api_guard(FakeRequest("127.0.0.1"))
+        assert_forbidden(
+            lambda: app_module.radius_api_guard(FakeRequest("10.0.0.5")),
+            "RADIUS guard accepted a non-local IP by default",
+        )
+
+        values.clear()
+        values.update({"radius.allowed_ips": ""})
+        assert_forbidden(
+            lambda: app_module.radius_api_guard(FakeRequest("127.0.0.1")),
+            "RADIUS guard accepted traffic with an empty allowlist",
+        )
+
+        values.clear()
+        values.update({"radius.allowed_ips": "10.0.0.0/24"})
+        app_module.radius_api_guard(FakeRequest("10.0.0.5"))
+        assert_forbidden(
+            lambda: app_module.radius_api_guard(FakeRequest("10.0.1.5")),
+            "RADIUS guard accepted an IP outside the configured CIDR",
+        )
+
+        values.clear()
+        values.update({"pbx.enabled": "1", "pbx.allowed_ips": ""})
+        assert_forbidden(
+            lambda: app_module.pbx_api_guard(FakeRequest("10.0.0.5")),
+            "PBX guard accepted traffic with an empty allowlist",
+        )
+
+        values.clear()
+        values.update({"pbx.enabled": "1", "pbx.allowed_ips": "10.0.0.0/24"})
+        app_module.pbx_api_guard(FakeRequest("10.0.0.5"))
+        assert_forbidden(
+            lambda: app_module.pbx_api_guard(FakeRequest("10.0.1.5")),
+            "PBX guard accepted an IP outside the configured CIDR",
+        )
+
+        values.clear()
+        values.update({"pbx.enabled": "0", "pbx.allowed_ips": "10.0.0.0/24"})
+        assert_forbidden(
+            lambda: app_module.pbx_api_guard(FakeRequest("10.0.0.5")),
+            "PBX guard accepted traffic while disabled",
+        )
+    finally:
+        app_module.get_setting = original_get_setting
+        app_module.audit = original_audit
+
+    ok("internal RADIUS and PBX guards fail closed and support CIDR allowlists")
 
 
 def check_pms_api_guard_settings() -> None:
@@ -440,6 +531,7 @@ def main() -> None:
     check_admin_tokens()
     check_opera_lookup_fallback()
     check_optional_api_guard()
+    check_internal_api_guards()
     check_pms_api_guard_settings()
     check_legacy_dusit_routes_use_pms_router()
     check_pms_check_result_renderer()
