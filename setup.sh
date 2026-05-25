@@ -155,6 +155,63 @@ detect_server_host() {
   printf '%s' "$host"
 }
 
+write_setup_summary() {
+  local summary_file="$PROJECT_DIR/setup-summary.txt"
+  local server_host
+  local admin_username
+  local admin_password
+  local radius_clients
+  local radius_secret
+
+  server_host=$(detect_server_host)
+  admin_username=$(read_env_value "ADMIN_USERNAME" "$ADMIN_USERNAME_VAL")
+  admin_password=$(read_env_value "ADMIN_PASSWORD" "")
+  radius_clients=$(read_env_value "RADIUS_CLIENTS" "$RADIUS_CLIENTS_DEFAULT")
+  radius_secret=$(read_env_value "RADIUS_SECRET" "")
+
+  {
+    echo "Hotspot Captive Portal setup summary"
+    echo "Generated at: $(date -Is 2>/dev/null || date)"
+    echo
+    echo "Admin panel:"
+    echo "  URL: http://$server_host:$PORT/admin/login"
+    echo "  Username: $admin_username"
+    if [ -n "$admin_password" ]; then
+      echo "  Password: $admin_password"
+    else
+      echo "  Password: existing admin password"
+    fi
+    echo
+    echo "FreeRADIUS:"
+    if [ "$INSTALL_RADIUS" = "1" ]; then
+      echo "  Server: $server_host"
+      echo "  Auth port: 1812"
+      echo "  Accounting port: 1813"
+      echo "  Allowed MikroTik clients: $radius_clients"
+      if [ -n "$radius_secret" ]; then
+        echo "  Shared secret: $radius_secret"
+      else
+        echo "  Shared secret: not configured"
+      fi
+    else
+      echo "  Not changed by this setup run."
+      if [ -n "$radius_secret" ]; then
+        echo "  Existing shared secret in .env: $radius_secret"
+        echo "  Existing allowed clients in .env: $radius_clients"
+      fi
+    fi
+    echo
+    echo "Files:"
+    echo "  Environment: $PROJECT_DIR/.env"
+    echo "  This summary: $summary_file"
+  } > "$summary_file"
+
+  chmod 600 "$summary_file"
+  echo
+  echo "Setup summary saved to:"
+  echo "  $summary_file"
+}
+
 print_next_steps() {
   local server_host
   local radius_clients
@@ -195,6 +252,8 @@ print_next_steps() {
   echo "Useful commands:"
   echo "  systemctl status hotspot-captive-portal.service"
   echo "  journalctl -u hotspot-captive-portal.service -f"
+
+  write_setup_summary
 }
 
 read_env_value() {
