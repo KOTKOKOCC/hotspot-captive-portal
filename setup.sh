@@ -11,6 +11,7 @@ ASSUME_YES=0
 UPGRADE_ONLY=0
 RUN_SMOKE=1
 INSTALL_RADIUS=1
+RADIUS_OPTION_SET=0
 PORT=8080
 ADMIN_USERNAME_VAL="admin"
 ADMIN_PASSWORD_VAL=""
@@ -26,9 +27,13 @@ Usage:
 Options:
   -y, --yes       Install with generated secrets and sensible defaults.
   --upgrade       Preserve .env and database, update dependencies/services, restart.
+  --with-radius   Install or reconfigure FreeRADIUS during --upgrade.
   --skip-radius   Do not install or configure FreeRADIUS.
   --skip-smoke    Do not run post-install smoke checks.
   -h, --help      Show this help.
+
+Notes:
+  --upgrade skips FreeRADIUS by default to avoid touching an existing RADIUS setup.
 EOF
 }
 
@@ -46,8 +51,13 @@ while [ "$#" -gt 0 ]; do
       UPGRADE_ONLY=1
       ASSUME_YES=1
       ;;
+    --with-radius)
+      INSTALL_RADIUS=1
+      RADIUS_OPTION_SET=1
+      ;;
     --skip-radius)
       INSTALL_RADIUS=0
+      RADIUS_OPTION_SET=1
       ;;
     --skip-smoke)
       RUN_SMOKE=0
@@ -62,6 +72,10 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+if [ "$UPGRADE_ONLY" = "1" ] && [ "$RADIUS_OPTION_SET" != "1" ]; then
+  INSTALL_RADIUS=0
+fi
 
 if ! command -v python3 >/dev/null 2>&1; then
   die "python3 not found. Install Python 3.10+ first."
