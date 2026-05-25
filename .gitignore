@@ -17,6 +17,7 @@ setup-summary.txt
 .venv/
 venv/
 backups/
+export_jobs/
 *.log
 *.bak
 *копия*.py

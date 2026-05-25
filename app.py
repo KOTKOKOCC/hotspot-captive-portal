@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Query, Request, Form, Body
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 from datetime import datetime, timedelta, timezone
 from html import escape
@@ -13,6 +13,7 @@ import subprocess
 import sqlite3
 import select
 import os
+import sys
 
 import logging
 
@@ -46,6 +47,14 @@ from app_services.opera_store import (
     delete_opera_site,
 )
 
+from app_services.export_jobs import (
+    init_export_jobs_table,
+    create_export_job,
+    get_export_job,
+    list_export_jobs,
+    mark_export_job_failed,
+)
+
 
 from labels import (
     COLUMN_LABELS,
@@ -69,9 +78,8 @@ from db import (
 )
 
 from exports import (
-    rows_to_xlsx_bytes,
-    build_single_xlsx,
-    build_export_zip,
+    export_formats,
+    export_table_names,
 )
 
 from integrations.mikrotik.api import (
@@ -1660,37 +1668,98 @@ def admin_logout():
     return resp
 
 
-@app.get("/admin/export/full")
-def admin_export_full(request: Request):
+def _safe_export_date(value: str | None) -> str:
+    value = (value or "").strip()
+    if not value:
+        return ""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise HTTPException(status_code=400, detail="bad export date")
+    return value
+
+
+def _export_job_redirect(job_id: int) -> RedirectResponse:
+    message = quote(f"Задача выгрузки #{job_id} создана")
+    return RedirectResponse(
+        url=f"/admin/system?section=export&ok={message}",
+        status_code=303,
+    )
+
+
+def _start_export_job_process(job_id: int) -> None:
+    log_dir = os.path.join(APP_DIR, "export_jobs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, f"job_{job_id}.log")
+    script_path = os.path.join(APP_DIR, "tools", "run_export_job.py")
+
+    with open(log_path, "ab") as log_file:
+        subprocess.Popen(
+            [sys.executable, script_path, str(job_id)],
+            cwd=APP_DIR,
+            stdout=log_file,
+            stderr=log_file,
+            start_new_session=True,
+        )
+
+
+def _queue_export_job(
+    request: Request,
+    table_name: str = "all",
+    fmt: str = "zip",
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> RedirectResponse:
     guard = role_guard(request, ("superadmin",))
     if guard:
         return guard
 
     username, role = get_current_admin_user(request)
+    table_name = (table_name or "all").strip().lower()
+    fmt = (fmt or "zip").strip().lower()
+    date_from = _safe_export_date(date_from)
+    date_to = _safe_export_date(date_to)
 
-    data = build_export_zip()
-    return StreamingResponse(
-        data,
-        media_type="application/zip",
-        headers={"Content-Disposition": 'attachment; filename="hotspot_export_full.zip"'}
+    allowed_tables = {"all", *export_table_names()}
+    if table_name not in allowed_tables:
+        raise HTTPException(status_code=400, detail="unknown export table")
+    if fmt not in export_formats():
+        raise HTTPException(status_code=400, detail="unknown export format")
+    if fmt == "xlsx" and table_name == "all":
+        raise HTTPException(status_code=400, detail="XLSX export supports one table only")
+
+    job_id = create_export_job(
+        username=username or "unknown",
+        table_name=table_name,
+        fmt=fmt,
+        date_from=date_from,
+        date_to=date_to,
     )
+    audit(
+        "export_requested",
+        details=(
+            f"user={username or '-'} job_id={job_id} table={table_name} "
+            f"format={fmt} date_from={date_from or '-'} date_to={date_to or '-'}"
+        ),
+    )
+
+    try:
+        _start_export_job_process(job_id)
+    except Exception as exc:
+        logger.exception("failed to start export job %s", job_id)
+        mark_export_job_failed(job_id, f"failed to start export process: {exc}")
+        audit("export_failed", details=f"user={username or '-'} job_id={job_id} error=start_failed")
+        raise HTTPException(status_code=500, detail="failed to start export")
+
+    return _export_job_redirect(job_id)
+
+
+@app.get("/admin/export/full")
+def admin_export_full(request: Request):
+    return _queue_export_job(request, table_name="all", fmt="zip")
 
 
 @app.get("/admin/export/period")
 def admin_export_period(request: Request, date_from: str | None = None, date_to: str | None = None):
-    guard = role_guard(request, ("superadmin",))
-    if guard:
-        return guard
-
-    username, role = get_current_admin_user(request)
-
-    data = build_export_zip(date_from=date_from, date_to=date_to)
-    filename = f"hotspot_export_{date_from or 'start'}_{date_to or 'end'}.zip"
-    return StreamingResponse(
-        data,
-        media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
-    )
+    return _queue_export_job(request, table_name="all", fmt="zip", date_from=date_from, date_to=date_to)
 
 
 @app.on_event("startup")
@@ -1700,6 +1769,7 @@ def startup():
     ensure_security_default_settings()
     init_onec_sites_table()
     init_opera_sites_table()
+    init_export_jobs_table()
     ensure_admin_users_table()
     ensure_guests_auth_columns()
     bootstrap_admin_users()
@@ -4528,6 +4598,133 @@ def build_system_tabs(section: str) -> str:
     """
 
 
+def build_export_body(ok: str = "") -> str:
+    table_labels = {
+        "all": "Все таблицы",
+        "guests": "Гости",
+        "sessions": "Сессии",
+        "pending": "Ожидание",
+        "calls": "Звонки",
+        "audit": "Аудит",
+        "networks": "Сети",
+    }
+    status_labels = {
+        "queued": "в очереди",
+        "running": "в работе",
+        "done": "готово",
+        "failed": "ошибка",
+    }
+
+    rows_html = ""
+    for job in list_export_jobs(limit=20):
+        job_id = int(job["id"])
+        status = str(job["status"] or "")
+        status_text = status_labels.get(status, status)
+        status_class = "active" if status == "done" else "pending" if status in ("queued", "running") else "error"
+        period = f'{job["date_from"] or "start"} - {job["date_to"] or "end"}'
+
+        download_html = ""
+        if status == "done":
+            download_html = f'<a class="btn table-btn" href="/admin/export/jobs/{job_id}/download">Скачать</a>'
+
+        error_html = ""
+        if status == "failed" and job["error"]:
+            error_html = f'<div class="muted">{escape(str(job["error"]))}</div>'
+
+        rows_html += f"""
+        <tr>
+          <td>{job_id}</td>
+          <td>{escape(table_labels.get(str(job["table_name"]), str(job["table_name"])))}</td>
+          <td>{escape(str(job["fmt"]).upper())}</td>
+          <td>{escape(period)}</td>
+          <td>{escape(str(job["username"] or ""))}</td>
+          <td>{escape(format_dt(job["created_at"]))}</td>
+          <td><span class="badge {status_class}">{escape(status_text)}</span>{error_html}</td>
+          <td>{download_html}</td>
+        </tr>
+        """
+
+    if not rows_html:
+        rows_html = '<tr><td colspan="8">Выгрузки пока не запускались.</td></tr>'
+
+    ok_html = ""
+    if ok:
+        ok_html = f'<div class="muted" style="margin-bottom:12px;">{escape(ok)}</div>'
+
+    return f"""
+    <div class="system-section">
+      <h2>Выгрузка данных</h2>
+      {ok_html}
+
+      <div class="toolbar">
+        <form class="export-form" method="post" action="/admin/export/jobs">
+
+          <div>
+            <label style="display:block; margin-bottom:6px; font-weight:600;">Что выгружать</label>
+            <select name="table_name">
+              <option value="all">Все таблицы</option>
+              <option value="guests">Гости</option>
+              <option value="sessions">Сессии</option>
+              <option value="pending">Ожидание</option>
+              <option value="calls">Звонки</option>
+              <option value="audit">Аудит</option>
+              <option value="networks">Сети</option>
+            </select>
+          </div>
+
+          <div>
+            <label style="display:block; margin-bottom:6px; font-weight:600;">Формат</label>
+            <select name="fmt">
+              <option value="zip">ZIP (CSV)</option>
+              <option value="xlsx">XLSX</option>
+            </select>
+          </div>
+
+          <div>
+            <label style="display:block; margin-bottom:6px; font-weight:600;">Дата с</label>
+            <input type="date" name="date_from">
+          </div>
+
+          <div>
+            <label style="display:block; margin-bottom:6px; font-weight:600;">Дата по</label>
+            <input type="date" name="date_to">
+          </div>
+
+          <div>
+            <button class="btn primary" type="submit">Создать выгрузку</button>
+          </div>
+
+        </form>
+      </div>
+
+      <div class="muted">
+        Полная выгрузка создаётся в отдельном процессе. Страница портала не ждёт сборку файла и не должна зависать.
+      </div>
+
+      <h3 style="margin-top:18px;">Последние выгрузки</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Данные</th>
+              <th>Формат</th>
+              <th>Период</th>
+              <th>Пользователь</th>
+              <th>Создано</th>
+              <th>Статус</th>
+              <th>Действия</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows_html}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    """
+
+
 @app.get("/admin/system", response_class=HTMLResponse)
 def admin_system(request: Request, section: str = "export", password_id: str = "", ok: str = ""):
     guard = role_guard(request, ("superadmin",))
@@ -4541,56 +4738,7 @@ def admin_system(request: Request, section: str = "export", password_id: str = "
     tabs = build_system_tabs(section)
 
     if section == "export":
-        content = """
-        <div class="system-section">
-          <h2>Выгрузка данных</h2>
-
-          <div class="toolbar">
-            <form class="export-form" method="get" action="/admin/export/download">
-
-              <div>
-                <label style="display:block; margin-bottom:6px; font-weight:600;">Что выгружать</label>
-                <select name="table_name">
-                  <option value="all">Все таблицы</option>
-                  <option value="guests">Гости</option>
-                  <option value="sessions">Сессии</option>
-                  <option value="pending">Pending</option>
-                  <option value="calls">Звонки</option>
-                  <option value="audit">Аудит</option>
-                  <option value="networks">Сети</option>
-                </select>
-              </div>
-
-              <div>
-                <label style="display:block; margin-bottom:6px; font-weight:600;">Формат</label>
-                <select name="fmt">
-                  <option value="zip">ZIP (CSV)</option>
-                  <option value="xlsx">XLSX</option>
-                </select>
-              </div>
-
-              <div>
-                <label style="display:block; margin-bottom:6px; font-weight:600;">Дата с</label>
-                <input type="date" name="date_from">
-              </div>
-
-              <div>
-                <label style="display:block; margin-bottom:6px; font-weight:600;">Дата по</label>
-                <input type="date" name="date_to">
-              </div>
-
-              <div>
-                <button class="btn primary" type="submit">Скачать</button>
-              </div>
-
-            </form>
-          </div>
-
-          <div class="muted">
-            Если выбран формат XLSX, выгружается одна таблица. Для полной выгрузки всех таблиц используйте ZIP.
-          </div>
-        </div>
-        """
+        content = build_export_body(ok=ok)
 
     elif section == "networks":
         content = f"""
@@ -5241,74 +5389,68 @@ def admin_export_xlsx(
     date_from: str | None = None,
     date_to: str | None = None
 ):
-    guard = role_guard(request, ("superadmin",))
-    if guard:
-        return guard
-
-    username, role = get_current_admin_user(request)
-
-    data = build_single_xlsx(table_name, date_from=date_from, date_to=date_to)
-    filename = f"{table_name}_{date_from or 'all'}_{date_to or 'all'}.xlsx"
-
-    return StreamingResponse(
-        data,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
-    )
+    return _queue_export_job(request, table_name=table_name, fmt="xlsx", date_from=date_from, date_to=date_to)
 
 @app.get("/admin/export", response_class=HTMLResponse)
-def admin_export_page(request: Request):
+def admin_export_page(request: Request, ok: str = ""):
     guard = role_guard(request, ("superadmin",))
     if guard:
         return guard
 
     username, role = get_current_admin_user(request)
+    return admin_page("Выгрузка", build_export_body(ok=ok), active_tab="export")
 
-    body = """
-    <div class="toolbar">
-      <form class="export-form" method="get" action="/admin/export/download">
-        <div>
-          <label style="display:block; margin-bottom:6px; font-weight:600;">Что выгружать</label>
-          <select name="table_name">
-            <option value="all">Все таблицы</option>
-            <option value="guests">Гости</option>
-            <option value="sessions">Сессии</option>
-            <option value="pending">Pending</option>
-            <option value="calls">Звонки</option>
-            <option value="audit">Аудит</option>
-            <option value="networks">Сети</option>
-          </select>
-        </div>
 
-        <div>
-          <label style="display:block; margin-bottom:6px; font-weight:600;">Формат</label>
-          <select name="fmt">
-            <option value="zip">ZIP (CSV)</option>
-            <option value="xlsx">XLSX</option>
-          </select>
-        </div>
+@app.post("/admin/export/jobs")
+def admin_export_jobs_create(
+    request: Request,
+    table_name: str = Form("all"),
+    fmt: str = Form("zip"),
+    date_from: str | None = Form(None),
+    date_to: str | None = Form(None),
+):
+    return _queue_export_job(
+        request,
+        table_name=table_name,
+        fmt=fmt,
+        date_from=date_from,
+        date_to=date_to,
+    )
 
-        <div>
-          <label style="display:block; margin-bottom:6px; font-weight:600;">Дата с</label>
-          <input type="date" name="date_from">
-        </div>
 
-        <div>
-          <label style="display:block; margin-bottom:6px; font-weight:600;">Дата по</label>
-          <input type="date" name="date_to">
-        </div>
+@app.get("/admin/export/jobs/{job_id}/download")
+def admin_export_job_download(request: Request, job_id: int):
+    guard = role_guard(request, ("superadmin",))
+    if guard:
+        return guard
 
-        <div>
-          <button class="btn primary" type="submit">Скачать</button>
-        </div>
-      </form>
-    </div>
+    username, role = get_current_admin_user(request)
+    job = get_export_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="export job not found")
+    if job["status"] != "done":
+        raise HTTPException(status_code=409, detail="export job is not ready")
 
-    <div class="muted">
-      Если выбран формат XLSX, выгружается одна таблица. Для полной выгрузки всех таблиц используйте ZIP.
-    </div>
-    """
-    return admin_page("Выгрузка", body, active_tab="export")
+    file_path = str(job["file_path"] or "")
+    file_name = str(job["file_name"] or f"export_job_{job_id}")
+    export_dir = os.path.realpath(os.path.join(APP_DIR, "export_jobs"))
+    real_file_path = os.path.realpath(file_path) if file_path else ""
+    if not real_file_path or os.path.commonpath([export_dir, real_file_path]) != export_dir:
+        raise HTTPException(status_code=404, detail="export file not found")
+    if not real_file_path or not os.path.exists(real_file_path):
+        raise HTTPException(status_code=404, detail="export file not found")
+
+    audit(
+        "export_downloaded",
+        details=f"user={username or '-'} job_id={job_id} table={job['table_name']} format={job['fmt']}",
+    )
+
+    media_type = (
+        "application/zip"
+        if job["fmt"] == "zip"
+        else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+    return FileResponse(real_file_path, media_type=media_type, filename=file_name)
 
 
 @app.get("/admin/export/download")
@@ -5319,34 +5461,13 @@ def admin_export_download(
     date_from: str | None = None,
     date_to: str | None = None
 ):
-    guard = role_guard(request, ("superadmin",))
-    if guard:
-        return guard
-
-    username, role = get_current_admin_user(request)
-
-    if fmt == "zip":
-        data = build_export_zip(date_from=date_from, date_to=date_to)
-        filename = f"miracleon_export_{date_from or 'start'}_{date_to or 'end'}.zip"
-        return StreamingResponse(
-            data,
-            media_type="application/zip",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
-        )
-
-    if fmt == "xlsx":
-        if table_name == "all":
-            raise HTTPException(status_code=400, detail="XLSX export supports one table only")
-
-        data = build_single_xlsx(table_name, date_from=date_from, date_to=date_to)
-        filename = f"{table_name}_{date_from or 'all'}_{date_to or 'all'}.xlsx"
-        return StreamingResponse(
-            data,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
-        )
-
-    raise HTTPException(status_code=400, detail="unknown format")
+    return _queue_export_job(
+        request,
+        table_name=table_name,
+        fmt=fmt,
+        date_from=date_from,
+        date_to=date_to,
+    )
 
 
 @app.get("/admin/dashboard-data")

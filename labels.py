@@ -60,6 +60,10 @@ EVENT_LABELS = {
     "admin_create_voucher": "Создан ваучер",
     "admin_revoke_voucher": "Ваучер отключён",
     "admin_voucher_remove_device": "Устройство освобождено из ваучера",
+    "export_requested": "Запрошена выгрузка",
+    "export_completed": "Выгрузка готова",
+    "export_failed": "Ошибка выгрузки",
+    "export_downloaded": "Выгрузка скачана",
 }
 
 

@@ -18,6 +18,8 @@ CRITICAL_ROUTES = {
     ("GET", "/admin/settings"),
     ("GET", "/admin/system"),
     ("POST", "/admin/settings/pms-check"),
+    ("POST", "/admin/export/jobs"),
+    ("GET", "/admin/export/jobs/{job_id}/download"),
 }
 
 
@@ -701,6 +703,109 @@ def check_retention_cleanup() -> None:
     ok("retention cleanup keeps at least 180 days and deletes older personal records")
 
 
+def check_export_jobs() -> None:
+    import os
+    import subprocess
+    import tempfile
+    from datetime import datetime, timezone
+    from zipfile import ZipFile
+
+    import app_services.settings_store as settings_store
+    import db as db_module
+    from app_services.export_jobs import (
+        create_export_job,
+        get_export_job,
+        init_export_jobs_table,
+        list_export_jobs,
+        mark_export_job_done,
+        mark_export_job_running,
+    )
+    from db import init_db
+    from exports import write_export_zip_file, write_single_xlsx_file
+
+    original_db_path = db_module.DB_PATH
+    original_settings_db_path = settings_store.DB_PATH
+
+    with tempfile.TemporaryDirectory() as tmp:
+        test_db = Path(tmp) / "exports.db"
+        db_module.DB_PATH = str(test_db)
+        settings_store.DB_PATH = str(test_db)
+
+        try:
+            init_db()
+            init_export_jobs_table()
+            now = datetime.now(timezone.utc).isoformat()
+
+            conn = db_module.db()
+            conn.execute("""
+                INSERT INTO guests (
+                    phone, first_verified_at, first_hotel, auth_method,
+                    status, created_at, updated_at, last_auth_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                "79990000999",
+                now,
+                "Smoke",
+                "call",
+                "active",
+                now,
+                now,
+                now,
+            ))
+            conn.commit()
+            conn.close()
+
+            job_id = create_export_job("smoke", "guests", "xlsx")
+            mark_export_job_running(job_id)
+            mark_export_job_done(job_id, Path(tmp) / "guests.xlsx", "guests.xlsx")
+            job = get_export_job(job_id)
+            if not job or job["status"] != "done":
+                fail("export job state did not move to done")
+            if not list_export_jobs(limit=1) or int(list_export_jobs(limit=1)[0]["id"]) != job_id:
+                fail("export job list did not return newest job")
+
+            zip_path = Path(tmp) / "export.zip"
+            xlsx_path = Path(tmp) / "guests.xlsx"
+            write_export_zip_file(zip_path, table_name="all")
+            write_single_xlsx_file(xlsx_path, table_name="guests")
+
+            if zip_path.stat().st_size <= 0 or xlsx_path.stat().st_size <= 0:
+                fail("export writers produced empty files")
+
+            with ZipFile(zip_path) as zf:
+                names = set(zf.namelist())
+                if "guests.csv" not in names or "audit_log.csv" not in names:
+                    fail("export zip is missing expected CSV files")
+
+            process_job_id = create_export_job("smoke", "guests", "xlsx")
+            env = os.environ.copy()
+            env["DB_PATH"] = str(test_db)
+            env["EXPORT_JOBS_DIR"] = tmp
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+            result = subprocess.run(
+                [sys.executable, str(PROJECT_ROOT / "tools" / "run_export_job.py"), str(process_job_id)],
+                cwd=PROJECT_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode != 0:
+                fail(f"export job worker failed: {result.stderr or result.stdout}")
+
+            process_job = get_export_job(process_job_id)
+            if not process_job or process_job["status"] != "done":
+                fail("export job worker did not mark job as done")
+            if not Path(process_job["file_path"]).exists():
+                fail("export job worker did not create output file")
+        finally:
+            db_module.DB_PATH = original_db_path
+            settings_store.DB_PATH = original_settings_db_path
+
+    ok("export jobs are persisted and worker creates files outside the web request")
+
+
 def fetch_no_redirect(url: str):
     opener = urllib.request.build_opener(NoRedirect)
     request = urllib.request.Request(url, method="GET")
@@ -743,6 +848,7 @@ def main() -> None:
     check_pms_check_result_renderer()
     check_reauth_window_setting()
     check_retention_cleanup()
+    check_export_jobs()
 
     if args.base_url:
         check_http(args.base_url)
