@@ -615,6 +615,58 @@ run_smoke_checks() {
   fi
 }
 
+write_radius_accounting_forward_module() {
+  local fr_dir="$1"
+
+  chmod 755 "$PROJECT_DIR/scripts/radius_accounting_forward.py"
+  cat > "$fr_dir/mods-available/hotspot_accounting_forward" <<EOF
+exec hotspot_accounting_forward {
+    wait = yes
+    input_pairs = request
+    shell_escape = yes
+    program = "$PROJECT_DIR/scripts/radius_accounting_forward.py '%{%{Acct-Status-Type}:-}' '%{%{Acct-Session-Id}:-}' '%{%{User-Name}:-}' '%{%{Calling-Station-Id}:-}' '%{%{Framed-IP-Address}:-}' '%{%{NAS-IP-Address}:-}' '%{%{NAS-Identifier}:-}' '%{%{NAS-Port-Id}:-}' '%{%{Called-Station-Id}:-}' '%{%{Acct-Terminate-Cause}:-}' '%{%{Acct-Session-Time}:-0}' '%{%{Event-Timestamp}:-}'"
+}
+EOF
+
+  chmod 644 "$fr_dir/mods-available/hotspot_accounting_forward"
+  ln -sf ../mods-available/hotspot_accounting_forward "$fr_dir/mods-enabled/hotspot_accounting_forward"
+}
+
+repair_freeradius_accounting_forwarder() {
+  local fr_dir="/etc/freeradius/3.0"
+  local module="$fr_dir/mods-available/hotspot_accounting_forward"
+  local expected="$PROJECT_DIR/scripts/radius_accounting_forward.py"
+
+  if [ "$(id -u)" -ne 0 ]; then
+    return
+  fi
+
+  if [ ! -d "$fr_dir" ] || [ ! -f "$module" ]; then
+    return
+  fi
+
+  if [ ! -f "$expected" ]; then
+    echo "WARN: FreeRADIUS accounting forwarder script not found: $expected"
+    return
+  fi
+
+  if grep -Fq "$expected" "$module" && [ -L "$fr_dir/mods-enabled/hotspot_accounting_forward" ]; then
+    echo "FreeRADIUS accounting forwarder already points to this project."
+    return
+  fi
+
+  echo "Updating FreeRADIUS accounting forwarder path."
+  write_radius_accounting_forward_module "$fr_dir"
+
+  if ! freeradius -XC >/tmp/hotspot-freeradius-check.log 2>&1; then
+    cat /tmp/hotspot-freeradius-check.log
+    die "FreeRADIUS config check failed"
+  fi
+
+  systemctl restart freeradius.service
+  echo "FreeRADIUS accounting forwarder updated."
+}
+
 install_freeradius_stack() {
   local fr_dir="/etc/freeradius/3.0"
   local clients_conf="$fr_dir/clients.conf"
@@ -627,6 +679,7 @@ install_freeradius_stack() {
 
   if [ "$INSTALL_RADIUS" != "1" ]; then
     echo "Skipping FreeRADIUS install."
+    repair_freeradius_accounting_forwarder
     return
   fi
 
@@ -723,18 +776,7 @@ EOF
   fi
   ln -sf ../mods-available/hotspot_portal_rest "$fr_dir/mods-enabled/hotspot_portal_rest"
 
-  chmod 755 "$PROJECT_DIR/scripts/radius_accounting_forward.py"
-  cat > "$fr_dir/mods-available/hotspot_accounting_forward" <<EOF
-exec hotspot_accounting_forward {
-    wait = yes
-    input_pairs = request
-    shell_escape = yes
-    program = "$PROJECT_DIR/scripts/radius_accounting_forward.py '%{%{Acct-Status-Type}:-}' '%{%{Acct-Session-Id}:-}' '%{%{User-Name}:-}' '%{%{Calling-Station-Id}:-}' '%{%{Framed-IP-Address}:-}' '%{%{NAS-IP-Address}:-}' '%{%{NAS-Identifier}:-}' '%{%{NAS-Port-Id}:-}' '%{%{Called-Station-Id}:-}' '%{%{Acct-Terminate-Cause}:-}' '%{%{Acct-Session-Time}:-0}' '%{%{Event-Timestamp}:-}'"
-}
-EOF
-
-  chmod 644 "$fr_dir/mods-available/hotspot_accounting_forward"
-  ln -sf ../mods-available/hotspot_accounting_forward "$fr_dir/mods-enabled/hotspot_accounting_forward"
+  write_radius_accounting_forward_module "$fr_dir"
 
   if [ -f "$default_site.hotspot-original" ]; then
     mv "$default_site.hotspot-original" "$PROJECT_DIR/backups/freeradius-default-site.hotspot-original"
