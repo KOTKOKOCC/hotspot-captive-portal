@@ -124,10 +124,14 @@ from services import (
 )
 
 from auth import (
+    MIN_REAUTH_DAYS,
+    DEFAULT_REAUTH_DAYS,
+    MAX_REAUTH_DAYS,
     now,
     now_iso,
     normalize_phone,
     normalize_mac,
+    get_reauth_window_days,
     get_active_guest,
     get_or_create_guest,
     touch_guest_auth,
@@ -191,6 +195,8 @@ def ensure_security_default_settings() -> None:
         set_setting("retention.days", DEFAULT_RETENTION_DAYS)
     if get_setting("retention.batch_size", None) is None:
         set_setting("retention.batch_size", DEFAULT_RETENTION_BATCH_SIZE)
+    if get_setting("auth.reauth_days", None) is None:
+        set_setting("auth.reauth_days", DEFAULT_REAUTH_DAYS)
 
 
 def mask_phone(phone: str | None) -> str:
@@ -890,6 +896,7 @@ def build_settings_body(ok: str = "", pms_check: dict | None = None):
     """
 
     radius_allowed_ips = str(get_setting("radius.allowed_ips", ",".join(DEFAULT_RADIUS_ALLOWED_IPS)))
+    auth_reauth_days = get_reauth_window_days()
     pbx_enabled = str(get_setting("pbx.enabled", "1")) == "1"
     pbx_allowed_ips = str(get_setting("pbx.allowed_ips", ",".join(PBX_ALLOWED_IPS)))
 
@@ -963,6 +970,28 @@ def build_settings_body(ok: str = "", pms_check: dict | None = None):
 
             <div class="settings-field" style="align-self:end;">
               <button type="submit" class="btn btn-primary">Сохранить MikroTik</button>
+            </div>
+          </div>
+        </form>
+      </div>
+
+
+      <div class="settings-card">
+        <form method="post" action="/admin/settings/auth-policy">
+          <h3 style="margin:0 0 12px;">Авторизация гостей</h3>
+
+          <div class="settings-grid settings-grid-pbx">
+            <div class="settings-field">
+              <label>Повторный вход, дней</label>
+              <input type="number"
+                   name="auth_reauth_days"
+                   min="{MIN_REAUTH_DAYS}"
+                   max="{MAX_REAUTH_DAYS}"
+                   value="{auth_reauth_days}">
+            </div>
+
+            <div class="settings-field" style="align-self:end;">
+              <button type="submit" class="btn btn-primary">Сохранить авторизацию</button>
             </div>
           </div>
         </form>
@@ -1327,6 +1356,21 @@ def admin_settings_mikrotik_save(
         set_setting("mikrotik.password", password.strip(), is_secret=True)
 
     return RedirectResponse(url="/admin/system?section=settings&ok=1", status_code=303)
+
+
+@app.post("/admin/settings/auth-policy")
+def admin_settings_auth_policy(
+    request: Request,
+    auth_reauth_days: int = Form(DEFAULT_REAUTH_DAYS),
+):
+    guard = role_guard(request, ("superadmin",))
+    if guard:
+        return guard
+
+    auth_reauth_days = max(MIN_REAUTH_DAYS, min(MAX_REAUTH_DAYS, int(auth_reauth_days)))
+    set_setting("auth.reauth_days", auth_reauth_days)
+
+    return RedirectResponse(url="/admin/system?section=settings&ok=auth_policy", status_code=303)
 
 
 @app.post("/admin/settings/radius-api")

@@ -1,7 +1,12 @@
 import re
 from datetime import datetime, timezone
 
+from app_services.settings_store import get_setting
 from db import db
+
+MIN_REAUTH_DAYS = 1
+DEFAULT_REAUTH_DAYS = 4
+MAX_REAUTH_DAYS = 30
 
 
 def now():
@@ -45,16 +50,30 @@ def make_room_identity(room_num: str, surname: str) -> str:
     return f"room:{room}|{sur}"
 
 
+def get_reauth_window_days() -> int:
+    try:
+        days = int(get_setting("auth.reauth_days", DEFAULT_REAUTH_DAYS))
+    except Exception:
+        days = DEFAULT_REAUTH_DAYS
+
+    return max(MIN_REAUTH_DAYS, min(MAX_REAUTH_DAYS, days))
+
+
+def reauth_window_modifier() -> str:
+    return f"-{get_reauth_window_days()} days"
+
+
 def get_active_guest(phone: str):
+    modifier = reauth_window_modifier()
     conn = db()
     row = conn.execute("""
         SELECT *
         FROM guests
         WHERE phone = ?
           AND status = 'active'
-          AND datetime(last_auth_at) >= datetime('now', '-3 days')
+          AND datetime(last_auth_at) >= datetime('now', ?)
         LIMIT 1
-    """, (phone,)).fetchone()
+    """, (phone, modifier)).fetchone()
     conn.close()
     return row
 
@@ -274,6 +293,7 @@ def update_session(session_id, ip, nas_id, hotel, ssid, vlan_id):
     
 
 def get_recent_authorized_session_by_mac(mac: str):
+    modifier = reauth_window_modifier()
     conn = db()
     row = conn.execute("""
         SELECT
@@ -286,10 +306,9 @@ def get_recent_authorized_session_by_mac(mac: str):
         JOIN guests g ON g.id = s.guest_id
         WHERE s.mac = ?
           AND g.status = 'active'
-          AND datetime(COALESCE(s.last_seen_at, s.ended_at, s.started_at, g.last_auth_at)) >= datetime('now', '-3 days')
+          AND datetime(COALESCE(s.last_seen_at, s.ended_at, s.started_at, g.last_auth_at)) >= datetime('now', ?)
         ORDER BY datetime(COALESCE(s.last_seen_at, s.ended_at, s.started_at, g.last_auth_at)) DESC, s.id DESC
         LIMIT 1
-    """, (mac,)).fetchone()
+    """, (mac, modifier)).fetchone()
     conn.close()
     return row
-

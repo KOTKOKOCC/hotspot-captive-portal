@@ -495,6 +495,90 @@ def check_pms_check_result_renderer() -> None:
     ok("PMS check renderer explains found, not found, and config states")
 
 
+def check_reauth_window_setting() -> None:
+    import tempfile
+    from datetime import datetime, timedelta, timezone
+
+    import auth as auth_module
+    import db as db_module
+    import app_services.settings_store as settings_store
+    from app_services.settings_store import set_setting
+    from db import init_db
+
+    original_db_path = db_module.DB_PATH
+    original_settings_db_path = settings_store.DB_PATH
+
+    old_but_allowed = (datetime.now(timezone.utc) - timedelta(days=3, hours=12)).isoformat()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        test_db = Path(tmp) / "reauth.db"
+        db_module.DB_PATH = str(test_db)
+        settings_store.DB_PATH = str(test_db)
+
+        try:
+            init_db()
+            conn = db_module.db()
+            conn.execute("""
+                INSERT INTO guests (
+                    phone, first_verified_at, first_hotel, auth_method,
+                    status, created_at, updated_at, last_auth_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                "79990000444",
+                old_but_allowed,
+                "FioLeto",
+                "call",
+                "active",
+                old_but_allowed,
+                old_but_allowed,
+                old_but_allowed,
+            ))
+            guest_id = conn.execute("SELECT id FROM guests WHERE phone = ?", ("79990000444",)).fetchone()["id"]
+            conn.execute("""
+                INSERT INTO guest_sessions (
+                    guest_id, phone, mac, ip, nas_id, hotel, ssid, vlan_id,
+                    started_at, last_seen_at, status
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                guest_id,
+                "79990000444",
+                "AA:BB:CC:DD:EE:44",
+                "10.32.0.44",
+                "nas",
+                "FioLeto",
+                "MIRACLEON",
+                "302",
+                old_but_allowed,
+                old_but_allowed,
+                "closed",
+            ))
+            conn.commit()
+            conn.close()
+
+            set_setting("auth.reauth_days", 4)
+            if auth_module.get_active_guest("79990000444") is None:
+                fail("reauth window setting did not allow a 3.5-day phone identity")
+            if auth_module.get_recent_authorized_session_by_mac("AA:BB:CC:DD:EE:44") is None:
+                fail("reauth window setting did not allow a 3.5-day MAC identity")
+
+            set_setting("auth.reauth_days", 3)
+            if auth_module.get_active_guest("79990000444") is not None:
+                fail("reauth window setting accepted a phone identity outside 3 days")
+            if auth_module.get_recent_authorized_session_by_mac("AA:BB:CC:DD:EE:44") is not None:
+                fail("reauth window setting accepted a MAC identity outside 3 days")
+
+            set_setting("auth.reauth_days", 999)
+            if auth_module.get_reauth_window_days() != auth_module.MAX_REAUTH_DAYS:
+                fail("reauth window setting did not clamp high values")
+        finally:
+            db_module.DB_PATH = original_db_path
+            settings_store.DB_PATH = original_settings_db_path
+
+    ok("guest reauthorization window is configurable and affects phone and MAC auth")
+
+
 def check_retention_cleanup() -> None:
     import tempfile
     from datetime import datetime, timedelta, timezone
@@ -657,6 +741,7 @@ def main() -> None:
     check_pms_api_guard_settings()
     check_legacy_dusit_routes_use_pms_router()
     check_pms_check_result_renderer()
+    check_reauth_window_setting()
     check_retention_cleanup()
 
     if args.base_url:
