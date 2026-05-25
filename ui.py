@@ -207,7 +207,7 @@ def admin_page(title: str, body: str, active_tab: str = "", role: str = "admin")
       <meta charset="utf-8">
       <title>{escape(title)}</title>
       <meta name="viewport" content="width=device-width, initial-scale=1">
-      <link rel="stylesheet" href="/static/admin.css">
+      <link rel="stylesheet" href="/static/admin.css?v={escape(APP_VERSION)}">
     </head>
     <body>
       <div class="wrap">
@@ -237,6 +237,5 @@ def admin_page(title: str, body: str, active_tab: str = "", role: str = "admin")
     </html>
     """
     return HTMLResponse(html)
-
 
 
