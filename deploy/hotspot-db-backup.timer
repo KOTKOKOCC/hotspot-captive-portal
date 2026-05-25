@@ -1,0 +1,9 @@
+[Unit]
+Description=Run Hotspot SQLite database backup nightly
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=30m
+
+[Install]
+WantedBy=timers.target

@@ -10,7 +10,7 @@ echo
 ASSUME_YES=0
 UPGRADE_ONLY=0
 RUN_SMOKE=1
-RUN_UPGRADE_BACKUP=1
+RUN_UPGRADE_BACKUP=0
 INSTALL_RADIUS=1
 RADIUS_OPTION_SET=0
 PORT=8080
@@ -31,12 +31,14 @@ Options:
   --upgrade       Preserve .env and database, update dependencies/services, restart.
   --with-radius   Install or reconfigure FreeRADIUS during --upgrade.
   --skip-radius   Do not install or configure FreeRADIUS.
+  --with-backup   Create and verify a pre-upgrade database backup.
   --skip-backup   Do not create a pre-upgrade database backup.
   --skip-smoke    Do not run post-install smoke checks.
   -h, --help      Show this help.
 
 Notes:
   --upgrade skips FreeRADIUS by default to avoid touching an existing RADIUS setup.
+  --upgrade skips database backup by default. Use --with-backup when needed.
 EOF
 }
 
@@ -61,6 +63,9 @@ while [ "$#" -gt 0 ]; do
     --skip-radius)
       INSTALL_RADIUS=0
       RADIUS_OPTION_SET=1
+      ;;
+    --with-backup)
+      RUN_UPGRADE_BACKUP=1
       ;;
     --skip-smoke)
       RUN_SMOKE=0
@@ -351,10 +356,7 @@ resolve_project_path() {
 create_upgrade_backup() {
   local db_path
   local db_abs
-  local backup_root
-  local timestamp
-  local backup_dir
-  local backup_db
+  local backup_output
 
   if [ "$UPGRADE_ONLY" != "1" ]; then
     return
@@ -365,6 +367,10 @@ create_upgrade_backup() {
     return
   fi
 
+  if [ ! -f "$PROJECT_DIR/tools/backup_sqlite.py" ]; then
+    die "tools/backup_sqlite.py not found; cannot create upgrade backup"
+  fi
+
   db_path=$(read_env_value "DB_PATH" "hotspot.db")
   db_abs=$(resolve_project_path "$db_path")
 
@@ -373,50 +379,15 @@ create_upgrade_backup() {
     return
   fi
 
-  backup_root="$PROJECT_DIR/backups"
-  timestamp=$(date +%Y%m%d-%H%M%S)
-  backup_dir="$backup_root/pre-upgrade-$timestamp"
-  backup_db="$backup_dir/$(basename "$db_abs")"
+  backup_output=$(python3 "$PROJECT_DIR/tools/backup_sqlite.py" \
+    --db "$db_abs" \
+    --dest-dir "$PROJECT_DIR/backups/pre-upgrade" \
+    --prefix "pre-upgrade" \
+    --keep 3 \
+    --include-env)
 
-  mkdir -p "$backup_dir"
-  chmod 700 "$backup_root" "$backup_dir"
-
-  echo "Creating pre-upgrade SQLite backup:"
-  echo "  Source: $db_abs"
-  echo "  Target: $backup_db"
-
-  python3 - "$db_abs" "$backup_db" <<'PY'
-import sqlite3
-import sys
-from pathlib import Path
-
-src = Path(sys.argv[1])
-dst = Path(sys.argv[2])
-
-dst.parent.mkdir(parents=True, exist_ok=True)
-
-source = sqlite3.connect(str(src), timeout=30)
-target = sqlite3.connect(str(dst))
-
-try:
-    source.backup(target)
-    result = target.execute("PRAGMA quick_check").fetchone()[0]
-    if result != "ok":
-        raise SystemExit(f"backup quick_check failed: {result}")
-finally:
-    target.close()
-    source.close()
-PY
-
-  chmod 600 "$backup_db"
-
-  if [ -f "$PROJECT_DIR/.env" ]; then
-    cp "$PROJECT_DIR/.env" "$backup_dir/env.snapshot"
-    chmod 600 "$backup_dir/env.snapshot"
-  fi
-
-  UPGRADE_BACKUP_DIR="$backup_dir"
-  echo "Pre-upgrade backup created and verified."
+  echo "$backup_output"
+  UPGRADE_BACKUP_DIR=$(printf '%s\n' "$backup_output" | awk -F': ' '/^Backup directory:/ {print $2}' | tail -n 1)
 }
 
 check_required_files() {
@@ -863,8 +834,12 @@ fi
 
 if [ "$UPGRADE_ONLY" = "1" ]; then
   echo
-  echo "[pre] Creating upgrade safety backup"
-  create_upgrade_backup
+  if [ "$RUN_UPGRADE_BACKUP" = "1" ]; then
+    echo "[pre] Creating upgrade safety backup"
+    create_upgrade_backup
+  else
+    echo "[pre] Skipping database backup during upgrade. Use --with-backup to run it explicitly."
+  fi
 fi
 
 echo

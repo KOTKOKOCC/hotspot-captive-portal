@@ -1,0 +1,9 @@
+[Unit]
+Description=Hotspot SQLite database backup
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/hotspot-captive-portal
+EnvironmentFile=/opt/hotspot-captive-portal/.env
+ExecStart=/opt/hotspot-captive-portal/.venv/bin/python /opt/hotspot-captive-portal/tools/backup_sqlite.py --dest-dir /opt/hotspot-captive-portal/backups/db --keep 7 --include-env
