@@ -10,6 +10,7 @@ echo
 ASSUME_YES=0
 UPGRADE_ONLY=0
 RUN_SMOKE=1
+RUN_UPGRADE_BACKUP=1
 INSTALL_RADIUS=1
 RADIUS_OPTION_SET=0
 PORT=8080
@@ -18,6 +19,7 @@ ADMIN_PASSWORD_VAL=""
 ADMIN_PASSWORD_SOURCE="existing"
 RADIUS_CLIENTS_DEFAULT="10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
 RADIUS_SECRET_SOURCE="existing"
+UPGRADE_BACKUP_DIR=""
 
 usage() {
   cat <<EOF
@@ -29,6 +31,7 @@ Options:
   --upgrade       Preserve .env and database, update dependencies/services, restart.
   --with-radius   Install or reconfigure FreeRADIUS during --upgrade.
   --skip-radius   Do not install or configure FreeRADIUS.
+  --skip-backup   Do not create a pre-upgrade database backup.
   --skip-smoke    Do not run post-install smoke checks.
   -h, --help      Show this help.
 
@@ -61,6 +64,9 @@ while [ "$#" -gt 0 ]; do
       ;;
     --skip-smoke)
       RUN_SMOKE=0
+      ;;
+    --skip-backup)
+      RUN_UPGRADE_BACKUP=0
       ;;
     -h|--help)
       usage
@@ -221,6 +227,9 @@ write_setup_summary() {
     echo "Files:"
     echo "  Environment: $PROJECT_DIR/.env"
     echo "  This summary: $summary_file"
+    if [ -n "$UPGRADE_BACKUP_DIR" ]; then
+      echo "  Upgrade backup: $UPGRADE_BACKUP_DIR"
+    fi
   } > "$summary_file"
 
   chmod 600 "$summary_file"
@@ -324,6 +333,90 @@ ensure_runtime_env_defaults() {
   if [ -z "$(read_env_value "RADIUS_CLIENTS" "")" ]; then
     append_env_value "RADIUS_CLIENTS" "$RADIUS_CLIENTS_DEFAULT"
   fi
+}
+
+resolve_project_path() {
+  local path="$1"
+
+  case "$path" in
+    /*)
+      printf '%s' "$path"
+      ;;
+    *)
+      printf '%s/%s' "$PROJECT_DIR" "$path"
+      ;;
+  esac
+}
+
+create_upgrade_backup() {
+  local db_path
+  local db_abs
+  local backup_root
+  local timestamp
+  local backup_dir
+  local backup_db
+
+  if [ "$UPGRADE_ONLY" != "1" ]; then
+    return
+  fi
+
+  if [ "$RUN_UPGRADE_BACKUP" != "1" ]; then
+    echo "Skipping pre-upgrade backup."
+    return
+  fi
+
+  db_path=$(read_env_value "DB_PATH" "hotspot.db")
+  db_abs=$(resolve_project_path "$db_path")
+
+  if [ ! -f "$db_abs" ]; then
+    echo "No existing database found at $db_abs; skipping pre-upgrade backup."
+    return
+  fi
+
+  backup_root="$PROJECT_DIR/backups"
+  timestamp=$(date +%Y%m%d-%H%M%S)
+  backup_dir="$backup_root/pre-upgrade-$timestamp"
+  backup_db="$backup_dir/$(basename "$db_abs")"
+
+  mkdir -p "$backup_dir"
+  chmod 700 "$backup_root" "$backup_dir"
+
+  echo "Creating pre-upgrade SQLite backup:"
+  echo "  Source: $db_abs"
+  echo "  Target: $backup_db"
+
+  python3 - "$db_abs" "$backup_db" <<'PY'
+import sqlite3
+import sys
+from pathlib import Path
+
+src = Path(sys.argv[1])
+dst = Path(sys.argv[2])
+
+dst.parent.mkdir(parents=True, exist_ok=True)
+
+source = sqlite3.connect(str(src), timeout=30)
+target = sqlite3.connect(str(dst))
+
+try:
+    source.backup(target)
+    result = target.execute("PRAGMA quick_check").fetchone()[0]
+    if result != "ok":
+        raise SystemExit(f"backup quick_check failed: {result}")
+finally:
+    target.close()
+    source.close()
+PY
+
+  chmod 600 "$backup_db"
+
+  if [ -f "$PROJECT_DIR/.env" ]; then
+    cp "$PROJECT_DIR/.env" "$backup_dir/env.snapshot"
+    chmod 600 "$backup_dir/env.snapshot"
+  fi
+
+  UPGRADE_BACKUP_DIR="$backup_dir"
+  echo "Pre-upgrade backup created and verified."
 }
 
 check_required_files() {
@@ -766,6 +859,12 @@ if [ ! -d ".venv" ]; then
   echo "Virtual environment created."
 else
   echo "Virtual environment already exists."
+fi
+
+if [ "$UPGRADE_ONLY" = "1" ]; then
+  echo
+  echo "[pre] Creating upgrade safety backup"
+  create_upgrade_backup
 fi
 
 echo
