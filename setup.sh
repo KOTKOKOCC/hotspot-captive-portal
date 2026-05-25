@@ -632,6 +632,22 @@ EOF
   ln -sf ../mods-available/hotspot_accounting_forward "$fr_dir/mods-enabled/hotspot_accounting_forward"
 }
 
+restart_freeradius_service() {
+  local attempt
+
+  systemctl restart freeradius.service || true
+
+  for attempt in $(seq 1 20); do
+    if systemctl is-active --quiet freeradius.service; then
+      return
+    fi
+    sleep 1
+  done
+
+  systemctl status freeradius.service --no-pager -l || true
+  die "FreeRADIUS restart failed"
+}
+
 repair_freeradius_accounting_forwarder() {
   local fr_dir="/etc/freeradius/3.0"
   local module="$fr_dir/mods-available/hotspot_accounting_forward"
@@ -663,7 +679,7 @@ repair_freeradius_accounting_forwarder() {
     die "FreeRADIUS config check failed"
   fi
 
-  systemctl restart freeradius.service
+  restart_freeradius_service
   echo "FreeRADIUS accounting forwarder updated."
 }
 
@@ -856,7 +872,7 @@ PY
   fi
 
   systemctl enable freeradius.service
-  systemctl restart freeradius.service
+  restart_freeradius_service
   echo "FreeRADIUS configured for portal HTTP bridge."
 }
 
