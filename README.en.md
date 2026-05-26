@@ -8,7 +8,7 @@ The project combines a FastAPI admin panel, MikroTik Hotspot/RADIUS integration,
 phone call verification, room/surname PMS checks, vouchers, audit, exports, and
 basic service monitoring in one installable server application.
 
-Current version: `0.9.1`
+Current version: `0.9.2`
 
 ## What It Does
 

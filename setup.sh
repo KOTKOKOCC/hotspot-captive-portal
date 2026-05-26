@@ -174,7 +174,7 @@ read_app_version() {
   fi
 
   if [ -z "$version" ]; then
-    version="0.9.1"
+    version="0.9.2"
   fi
 
   printf '%s' "$version"

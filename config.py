@@ -25,9 +25,9 @@ def _read_app_version() -> str:
     try:
         version = (BASE_DIR / "VERSION").read_text(encoding="utf-8").strip()
     except OSError:
-        version = "0.9.1"
+        version = "0.9.2"
 
-    return version or "0.9.1"
+    return version or "0.9.2"
 
 
 APP_NAME = os.getenv("APP_NAME", "C-Portal")
