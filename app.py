@@ -276,7 +276,65 @@ def log_phone_event(event: str, phone: str | None = None, **fields):
     logger.info("%s %s", event, " ".join(parts))
 
 
+ADMIN_COOKIE_PATH = "/admin"
+ADMIN_CACHE_CONTROL = "no-store, no-cache, must-revalidate, max-age=0, private"
+
+
+def is_admin_path(path: str) -> bool:
+    return path == "/admin" or path.startswith("/admin/")
+
+
+def request_is_https(request: Request) -> bool:
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().lower()
+    return request.url.scheme == "https" or forwarded_proto == "https"
+
+
+def admin_cookie_secure(request: Request) -> bool:
+    mode = os.getenv("ADMIN_COOKIE_SECURE", "auto").strip().lower()
+    if mode in ("1", "true", "yes", "on"):
+        return True
+    if mode in ("0", "false", "no", "off"):
+        return False
+    return request_is_https(request)
+
+
+def set_admin_session_cookie(response, request: Request, token: str) -> None:
+    secure = admin_cookie_secure(request)
+    response.delete_cookie(ADMIN_COOKIE, path="/")
+    response.set_cookie(
+        key=ADMIN_COOKIE,
+        value=token,
+        max_age=ADMIN_SESSION_TTL_SECONDS,
+        httponly=True,
+        secure=secure,
+        samesite="lax",
+        path=ADMIN_COOKIE_PATH,
+    )
+
+
+def clear_admin_session_cookie(response, request: Request) -> None:
+    secure = admin_cookie_secure(request)
+    response.delete_cookie(ADMIN_COOKIE, path="/", secure=secure, httponly=True, samesite="lax")
+    response.delete_cookie(ADMIN_COOKIE, path=ADMIN_COOKIE_PATH, secure=secure, httponly=True, samesite="lax")
+
+
 app = FastAPI()
+
+
+@app.middleware("http")
+async def admin_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    if is_admin_path(request.url.path):
+        response.headers["Cache-Control"] = ADMIN_CACHE_CONTROL
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "same-origin"
+
+    return response
+
+
 ensure_room_auth_table()
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
@@ -1703,7 +1761,7 @@ def admin_login_page(error: str = ""):
 
 
 @app.post("/admin/login")
-def admin_login(username: str = Form(...), password: str = Form(...)):
+def admin_login(request: Request, username: str = Form(...), password: str = Form(...)):
     row = fetch_one("""
         SELECT username, password_hash, role, is_active
         FROM admin_users
@@ -1724,22 +1782,15 @@ def admin_login(username: str = Form(...), password: str = Form(...)):
 
     resp = RedirectResponse(url=redirect_url, status_code=303)
 
-    resp.set_cookie(
-        key=ADMIN_COOKIE,
-        value=make_admin_token(username, role),
-        httponly=True,
-        samesite="lax",
-        secure=False,
-        max_age=ADMIN_SESSION_TTL_SECONDS
-    )
+    set_admin_session_cookie(resp, request, make_admin_token(username, role))
 
     return resp
 
 
 @app.get("/admin/logout")
-def admin_logout():
+def admin_logout(request: Request):
     resp = RedirectResponse(url="/admin/login", status_code=303)
-    resp.delete_cookie(ADMIN_COOKIE)
+    clear_admin_session_cookie(resp, request)
     return resp
 
 

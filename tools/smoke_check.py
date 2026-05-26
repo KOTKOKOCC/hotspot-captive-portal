@@ -402,6 +402,137 @@ def check_admin_csrf_protection() -> None:
     ok("admin CSRF tokens protect POST forms and handlers")
 
 
+def check_admin_security_headers_and_cookie() -> None:
+    import asyncio
+    import os
+    import tempfile
+    from datetime import datetime, timezone
+
+    from fastapi.responses import HTMLResponse
+
+    import app as app_module
+    import db as db_module
+    from admin_auth import ROLE_SUPERADMIN, hash_admin_password
+    from config import ADMIN_COOKIE
+
+    original_db_path = db_module.DB_PATH
+    original_cookie_secure = os.environ.get("ADMIN_COOKIE_SECURE")
+
+    class FakeUrl:
+        def __init__(self, path: str, scheme: str = "http"):
+            self.path = path
+            self.scheme = scheme
+
+    class FakeRequest:
+        def __init__(self, path: str = "/admin", scheme: str = "http", headers: dict[str, str] | None = None):
+            self.url = FakeUrl(path, scheme)
+            self.headers = headers or {}
+            self.cookies = {}
+
+    def set_cookie_headers(response) -> list[str]:
+        return [
+            value.decode("latin1")
+            for key, value in response.raw_headers
+            if key.lower() == b"set-cookie"
+        ]
+
+    def find_cookie(headers: list[str], path_value: str, require_value: bool) -> str:
+        for header in headers:
+            lowered = header.lower()
+            if f"path={path_value}" in lowered and f"{ADMIN_COOKIE.lower()}=" in lowered:
+                if require_value and "max-age=0" in lowered:
+                    continue
+                if not require_value and "max-age=0" not in lowered:
+                    continue
+                return header
+        fail(f"Set-Cookie for path {path_value} was not found")
+
+    async def fake_call_next(_request):
+        return HTMLResponse("ok", headers={"Cache-Control": "public, max-age=60"})
+
+    admin_response = asyncio.run(
+        app_module.admin_security_headers(FakeRequest("/admin/sessions"), fake_call_next)
+    )
+    expected_headers = {
+        "Cache-Control": app_module.ADMIN_CACHE_CONTROL,
+        "Pragma": "no-cache",
+        "Expires": "0",
+        "X-Frame-Options": "DENY",
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "same-origin",
+    }
+    for header, expected in expected_headers.items():
+        if admin_response.headers.get(header) != expected:
+            fail(f"admin security header {header} expected {expected!r}, got {admin_response.headers.get(header)!r}")
+
+    api_response = asyncio.run(
+        app_module.admin_security_headers(FakeRequest("/radius-check"), fake_call_next)
+    )
+    if api_response.headers.get("X-Frame-Options") or api_response.headers.get("Cache-Control") != "public, max-age=60":
+        fail("admin security headers leaked onto non-admin API response")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        test_db = Path(tmp) / "admin_cookie.db"
+        db_module.DB_PATH = str(test_db)
+
+        try:
+            app_module.ensure_admin_users_table()
+            now = datetime.now(timezone.utc).isoformat()
+            conn = db_module.db()
+            conn.execute(
+                """
+                INSERT INTO admin_users (
+                    username, password_hash, role, is_active, created_at, updated_at
+                )
+                VALUES (?, ?, ?, 1, ?, ?)
+                """,
+                ("cookie_super", hash_admin_password("password"), ROLE_SUPERADMIN, now, now),
+            )
+            conn.commit()
+            conn.close()
+
+            os.environ.pop("ADMIN_COOKIE_SECURE", None)
+            response = app_module.admin_login(
+                FakeRequest("/admin/login", scheme="http"),
+                username="cookie_super",
+                password="password",
+            )
+            cookies = set_cookie_headers(response)
+            admin_cookie = find_cookie(cookies, "/admin", require_value=True).lower()
+            legacy_clear = find_cookie(cookies, "/", require_value=False).lower()
+
+            for required in ("httponly", "samesite=lax", "path=/admin"):
+                if required not in admin_cookie:
+                    fail(f"admin session cookie missing {required}")
+            if "secure" in admin_cookie:
+                fail("admin session cookie should not be Secure on plain HTTP by default")
+            if "path=/" not in legacy_clear or "max-age=0" not in legacy_clear:
+                fail("login should clear the legacy root-path admin cookie")
+
+            os.environ["ADMIN_COOKIE_SECURE"] = "1"
+            secure_response = app_module.admin_login(
+                FakeRequest("/admin/login", scheme="http"),
+                username="cookie_super",
+                password="password",
+            )
+            secure_cookie = find_cookie(set_cookie_headers(secure_response), "/admin", require_value=True).lower()
+            if "secure" not in secure_cookie:
+                fail("ADMIN_COOKIE_SECURE=1 did not force Secure on the admin cookie")
+
+            logout_response = app_module.admin_logout(FakeRequest("/admin/logout", scheme="http"))
+            logout_cookies = set_cookie_headers(logout_response)
+            find_cookie(logout_cookies, "/admin", require_value=False)
+            find_cookie(logout_cookies, "/", require_value=False)
+        finally:
+            db_module.DB_PATH = original_db_path
+            if original_cookie_secure is None:
+                os.environ.pop("ADMIN_COOKIE_SECURE", None)
+            else:
+                os.environ["ADMIN_COOKIE_SECURE"] = original_cookie_secure
+
+    ok("admin security headers and cookie flags are hardened")
+
+
 def check_opera_lookup_fallback() -> None:
     import sqlite3
     import tempfile
@@ -1206,6 +1337,7 @@ def main() -> None:
     check_admin_tokens()
     check_admin_role_access_matrix()
     check_admin_csrf_protection()
+    check_admin_security_headers_and_cookie()
     check_opera_lookup_fallback()
     check_optional_api_guard()
     check_internal_api_guards()

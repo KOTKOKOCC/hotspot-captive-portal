@@ -503,6 +503,7 @@ write_env_file() {
     echo "ADMIN_USERNAME=\"$(escape_env "$ADMIN_USERNAME_VAL")\""
     echo "ADMIN_PASSWORD=\"$(escape_env "$ADMIN_PASSWORD_VAL")\""
     echo "ADMIN_COOKIE=\"$(escape_env "$ADMIN_COOKIE_VAL")\""
+    echo "ADMIN_COOKIE_SECURE=\"auto\""
 
     echo "VOUCHER_SECRET_KEY=\"$(escape_env "$VOUCHER_SECRET_KEY_VAL")\""
     echo "OPERA_CACHE_DB_PATH=\"$(escape_env "$OPERA_CACHE_DB_PATH_VAL")\""
