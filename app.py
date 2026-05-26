@@ -119,6 +119,8 @@ from admin_auth import (
     hash_admin_password,
     normalize_admin_role,
     role_home_url,
+    make_admin_csrf_token,
+    require_admin_csrf,
 )
 
 SUPERADMIN_ROLES = (ROLE_SUPERADMIN,)
@@ -207,6 +209,31 @@ def split_csv_items(value) -> list[str]:
 
 def csv_setting_items(key: str, default_items: tuple[str, ...] | list[str] = ()) -> list[str]:
     return split_csv_items(get_setting(key, ",".join(default_items)))
+
+
+def render_admin_page(
+    request: Request,
+    title: str,
+    body: str,
+    active_tab: str = "",
+    role: str = "admin",
+) -> HTMLResponse:
+    return admin_page(
+        title,
+        body,
+        active_tab=active_tab,
+        role=role,
+        csrf_token=make_admin_csrf_token(request),
+    )
+
+
+def admin_post_guard(request: Request, allowed_roles: tuple[str, ...], csrf_token: str):
+    guard = role_guard(request, allowed_roles)
+    if guard:
+        return guard
+
+    require_admin_csrf(request, csrf_token)
+    return None
 
 
 def ensure_security_default_settings() -> None:
@@ -1386,13 +1413,14 @@ def admin_settings_page(request: Request, ok: str = ""):
 @app.post("/admin/settings/mikrotik")
 def admin_settings_mikrotik_save(
     request: Request,
+    csrf_token: str = Form(""),
     host: str = Form(""),
     port: int = Form(8728),
     user: str = Form(""),
     password: str = Form(""),
     device_sync_interval: int = Form(300),
 ):
-    guard = role_guard(request, ("superadmin",))
+    guard = admin_post_guard(request, ("superadmin",), csrf_token)
     if guard:
         return guard
 
@@ -1410,9 +1438,10 @@ def admin_settings_mikrotik_save(
 @app.post("/admin/settings/auth-policy")
 def admin_settings_auth_policy(
     request: Request,
+    csrf_token: str = Form(""),
     auth_reauth_days: int = Form(DEFAULT_REAUTH_DAYS),
 ):
-    guard = role_guard(request, ("superadmin",))
+    guard = admin_post_guard(request, ("superadmin",), csrf_token)
     if guard:
         return guard
 
@@ -1425,9 +1454,10 @@ def admin_settings_auth_policy(
 @app.post("/admin/settings/radius-api")
 def admin_settings_radius_api(
     request: Request,
+    csrf_token: str = Form(""),
     radius_allowed_ips: str = Form(""),
 ):
-    guard = role_guard(request, ("superadmin",))
+    guard = admin_post_guard(request, ("superadmin",), csrf_token)
     if guard:
         return guard
 
@@ -1439,10 +1469,11 @@ def admin_settings_radius_api(
 @app.post("/admin/settings/pbx")
 def admin_settings_pbx(
     request: Request,
+    csrf_token: str = Form(""),
     pbx_enabled: str = Form("0"),
     pbx_allowed_ips: str = Form(""),
 ):
-    guard = role_guard(request, ("superadmin",))
+    guard = admin_post_guard(request, ("superadmin",), csrf_token)
     if guard:
         return guard
 
@@ -1455,11 +1486,12 @@ def admin_settings_pbx(
 @app.post("/admin/settings/pms-api")
 def admin_settings_pms_api(
     request: Request,
+    csrf_token: str = Form(""),
     pms_api_enabled: str = Form("0"),
     pms_allowed_ips: str = Form(""),
     pms_api_token: str = Form(""),
 ):
-    guard = role_guard(request, ("superadmin",))
+    guard = admin_post_guard(request, ("superadmin",), csrf_token)
     if guard:
         return guard
 
@@ -1475,11 +1507,12 @@ def admin_settings_pms_api(
 @app.post("/admin/settings/retention")
 def admin_settings_retention(
     request: Request,
+    csrf_token: str = Form(""),
     retention_enabled: str = Form("0"),
     retention_days: int = Form(DEFAULT_RETENTION_DAYS),
     retention_batch_size: int = Form(DEFAULT_RETENTION_BATCH_SIZE),
 ):
-    guard = role_guard(request, ("superadmin",))
+    guard = admin_post_guard(request, ("superadmin",), csrf_token)
     if guard:
         return guard
 
@@ -1496,11 +1529,12 @@ def admin_settings_retention(
 @app.post("/admin/settings/pms-check", response_class=HTMLResponse)
 def admin_settings_pms_check(
     request: Request,
+    csrf_token: str = Form(""),
     hotel: str = Form(""),
     room_num: str = Form(""),
     surname: str = Form(""),
 ):
-    guard = role_guard(request, ("superadmin",))
+    guard = admin_post_guard(request, ("superadmin",), csrf_token)
     if guard:
         return guard
 
@@ -1519,12 +1553,13 @@ def admin_settings_pms_check(
     }
 
     content = build_system_tabs("settings") + build_settings_body(pms_check=pms_check)
-    return admin_page("Система", content, active_tab="system", role=role)
+    return render_admin_page(request, "Система", content, active_tab="system", role=role)
 
 
 @app.post("/admin/settings/onec")
 def admin_settings_onec_save(
     request: Request,
+    csrf_token: str = Form(""),
     name: str = Form(""),
     code: str = Form(""),
     base_url: str = Form(""),
@@ -1532,7 +1567,7 @@ def admin_settings_onec_save(
     enabled: int = Form(1),
     timeout: int = Form(5),
 ):
-    guard = role_guard(request, ("superadmin",))
+    guard = admin_post_guard(request, ("superadmin",), csrf_token)
     if guard:
         return guard
 
@@ -1552,9 +1587,10 @@ def admin_settings_onec_save(
 @app.post("/admin/settings/onec/delete")
 def admin_settings_onec_delete(
     request: Request,
+    csrf_token: str = Form(""),
     site_id: int = Form(...),
 ):
-    guard = role_guard(request, ("superadmin",))
+    guard = admin_post_guard(request, ("superadmin",), csrf_token)
     if guard:
         return guard
 
@@ -1566,6 +1602,7 @@ def admin_settings_onec_delete(
 @app.post("/admin/settings/opera")
 def admin_settings_opera_save(
     request: Request,
+    csrf_token: str = Form(""),
     name: str = Form(""),
     code: str = Form(""),
     host: str = Form(""),
@@ -1577,7 +1614,7 @@ def admin_settings_opera_save(
     connect_timeout: int = Form(10),
     reconnect_seconds: int = Form(30),
 ):
-    guard = role_guard(request, ("superadmin",))
+    guard = admin_post_guard(request, ("superadmin",), csrf_token)
     if guard:
         return guard
 
@@ -1601,9 +1638,10 @@ def admin_settings_opera_save(
 @app.post("/admin/settings/opera/delete")
 def admin_settings_opera_delete(
     request: Request,
+    csrf_token: str = Form(""),
     site_id: int = Form(...),
 ):
-    guard = role_guard(request, ("superadmin",))
+    guard = admin_post_guard(request, ("superadmin",), csrf_token)
     if guard:
         return guard
 
@@ -1791,12 +1829,20 @@ def _queue_export_job(
 
 @app.get("/admin/export/full")
 def admin_export_full(request: Request):
-    return _queue_export_job(request, table_name="all", fmt="zip")
+    guard = role_guard(request, ("superadmin",))
+    if guard:
+        return guard
+
+    return RedirectResponse(url="/admin/system?section=export", status_code=303)
 
 
 @app.get("/admin/export/period")
 def admin_export_period(request: Request, date_from: str | None = None, date_to: str | None = None):
-    return _queue_export_job(request, table_name="all", fmt="zip", date_from=date_from, date_to=date_to)
+    guard = role_guard(request, ("superadmin",))
+    if guard:
+        return guard
+
+    return RedirectResponse(url="/admin/system?section=export", status_code=303)
 
 
 @app.on_event("startup")
@@ -2904,7 +2950,7 @@ def admin_index(request: Request, denied: str = ""):
       setInterval(loadDashboardData, 30000);
     </script>
     """
-    return admin_page("Панель управления", body, active_tab="home", role=role)
+    return render_admin_page(request, "Панель управления", body, active_tab="home", role=role)
 
 
 @app.get("/admin/guests", response_class=HTMLResponse)
@@ -2969,7 +3015,7 @@ def admin_guests(request: Request):
     </div>
     """
 
-    return admin_page("Гости", body, active_tab="guests", role=role)
+    return render_admin_page(request, "Гости", body, active_tab="guests", role=role)
 
 
 @app.get("/admin/sessions", response_class=HTMLResponse)
@@ -3230,7 +3276,7 @@ def admin_sessions(
 
 
 
-    return admin_page("Сессии", body, active_tab="sessions", role=role)
+    return render_admin_page(request, "Сессии", body, active_tab="sessions", role=role)
 
 @app.get("/admin/pending", response_class=HTMLResponse)
 def admin_pending(request: Request):
@@ -3244,7 +3290,7 @@ def admin_pending(request: Request):
     rows = fetch_all("SELECT * FROM pending_auth WHERE status = 'pending' ORDER BY created_at DESC LIMIT 300")
     cols = ["id", "phone", "mac", "ip", "nas_id", "hotel", "ssid", "vlan_id", "created_at", "expires_at", "status"]
     body = html_table(rows, cols)
-    return admin_page("Ожидают подтверждения", body, active_tab="pending", role=role)
+    return render_admin_page(request, "Ожидают подтверждения", body, active_tab="pending", role=role)
 
 
 @app.get("/admin/calls", response_class=HTMLResponse)
@@ -3259,7 +3305,7 @@ def admin_calls(request: Request):
     rows = fetch_all("SELECT * FROM call_events ORDER BY created_at DESC LIMIT 300")
     cols = ["id", "phone", "callerid_raw", "source_ip", "created_at", "result"]
     body = html_table(rows, cols)
-    return admin_page("Звонки", body, active_tab="calls", role=role)
+    return render_admin_page(request, "Звонки", body, active_tab="calls", role=role)
 
 
 @app.get("/admin/vouchers", response_class=HTMLResponse)
@@ -3502,12 +3548,13 @@ def admin_vouchers(request: Request, error: str = "", ok: str = ""):
 
     body += table_html
     
-    return admin_page("Ваучеры", body, active_tab="vouchers", role=role)
+    return render_admin_page(request, "Ваучеры", body, active_tab="vouchers", role=role)
 
 
 @app.post("/admin/vouchers/create", response_class=HTMLResponse)
 def admin_vouchers_create(
     request: Request,
+    csrf_token: str = Form(""),
     full_name: str = Form(...),
     passport: str = Form(...),
     birth_date: str = Form(""),
@@ -3518,7 +3565,7 @@ def admin_vouchers_create(
     valid_days: int = Form(1),
     document_type: str = Form(...),
 ):
-    guard = role_guard(request, VOUCHER_ISSUE_ROLES)
+    guard = admin_post_guard(request, VOUCHER_ISSUE_ROLES, csrf_token)
     if guard:
         return guard
 
@@ -3591,7 +3638,7 @@ def admin_vouchers_create(
     </div>
     """
 
-    return admin_page("Ваучер создан", body, active_tab="vouchers", role=role)
+    return render_admin_page(request, "Ваучер создан", body, active_tab="vouchers", role=role)
 
 
 @app.get("/admin/vouchers/{voucher_id}", response_class=HTMLResponse)
@@ -3616,7 +3663,8 @@ def admin_voucher_detail(request: Request, voucher_id: int):
             details=f"user={username}, voucher_id={voucher_id}"
         )
         conn.close()
-        return admin_page(
+        return render_admin_page(
+            request,
             "Ваучер",
             "<div class='muted'>Ваучер не найден.</div>",
             active_tab="vouchers",
@@ -3756,7 +3804,7 @@ def admin_voucher_detail(request: Request, voucher_id: int):
         body += "<div class='muted'>По этому ваучеру пока нет подключенных устройств.</div>"
     
 
-    return admin_page("Ваучер", body, active_tab="vouchers", role=role)
+    return render_admin_page(request, "Ваучер", body, active_tab="vouchers", role=role)
 
 @app.get("/admin/vouchers/{voucher_id}/print", response_class=HTMLResponse)
 def admin_voucher_print(request: Request, voucher_id: int):
@@ -3914,9 +3962,10 @@ def admin_voucher_print(request: Request, voucher_id: int):
 @app.post("/admin/vouchers/revoke")
 def admin_vouchers_revoke(
     request: Request,
+    csrf_token: str = Form(""),
     voucher_id: int = Form(...),
 ):
-    guard = role_guard(request, SUPERADMIN_ROLES)
+    guard = admin_post_guard(request, SUPERADMIN_ROLES, csrf_token)
     if guard:
         return guard
 
@@ -3961,9 +4010,10 @@ def admin_vouchers_revoke(
 def admin_voucher_remove_device(
     request: Request,
     voucher_id: int,
+    csrf_token: str = Form(""),
     mac: str = Form(...),
 ):
-    guard = role_guard(request, SUPERADMIN_ROLES)
+    guard = admin_post_guard(request, SUPERADMIN_ROLES, csrf_token)
     if guard:
         return guard
 
@@ -4018,7 +4068,7 @@ def admin_audit(request: Request):
     rows = fetch_all("SELECT * FROM audit_log ORDER BY event_time DESC LIMIT 20")
     cols = ["id", "phone", "mac", "ip", "nas_id", "hotel", "ssid", "vlan_id", "event_type", "event_time", "details"]
     body = html_table(rows, cols)
-    return admin_page("Аудит", body, active_tab="audit", role=role)
+    return render_admin_page(request, "Аудит", body, active_tab="audit", role=role)
 
 
 @app.get("/admin/networks", response_class=HTMLResponse)
@@ -4030,7 +4080,7 @@ def admin_networks(request: Request, error: str = "", ok: str = "", edit_id: str
     username, role = get_current_admin_user(request)
 
     body = build_networks_body(error=error, ok=ok, edit_id=edit_id)
-    return admin_page("Сети", body, active_tab="networks", role=role)
+    return render_admin_page(request, "Сети", body, active_tab="networks", role=role)
 
 
 def build_networks_body(error: str = "", ok: str = "", edit_id: str = "", cancel_url: str = "/admin/networks"):
@@ -4222,6 +4272,7 @@ def build_networks_body(error: str = "", ok: str = "", edit_id: str = "", cancel
 @app.post("/admin/networks/add")
 def admin_networks_add(
     request: Request,
+    csrf_token: str = Form(""),
     hotel_name: str = Form(""),
     ssid_name: str = Form(""),
     vlan_id: str = Form(""),
@@ -4230,7 +4281,7 @@ def admin_networks_add(
     hotspot_server: str = Form(""),
     is_active: str = Form("1"),
 ):
-    guard = role_guard(request, ("superadmin",))
+    guard = admin_post_guard(request, ("superadmin",), csrf_token)
     if guard:
         return guard
 
@@ -4294,6 +4345,7 @@ def admin_networks_add(
 @app.post("/admin/networks/update")
 def admin_networks_update(
     request: Request,
+    csrf_token: str = Form(""),
     network_id: str = Form(""),
     hotel_name: str = Form(""),
     ssid_name: str = Form(""),
@@ -4303,7 +4355,7 @@ def admin_networks_update(
     hotspot_server: str = Form(""),
     is_active: str = Form("1"),
 ):
-    guard = role_guard(request, ("superadmin",))
+    guard = admin_post_guard(request, ("superadmin",), csrf_token)
     if guard:
         return guard
 
@@ -4383,9 +4435,10 @@ def admin_networks_update(
 @app.post("/admin/networks/toggle")
 def admin_networks_toggle(
     request: Request,
+    csrf_token: str = Form(""),
     network_id: str = Form(""),
 ):
-    guard = role_guard(request, ("superadmin",))
+    guard = admin_post_guard(request, ("superadmin",), csrf_token)
     if guard:
         return guard
 
@@ -4411,9 +4464,10 @@ def admin_networks_toggle(
 @app.post("/admin/networks/delete")
 def admin_networks_delete(
     request: Request,
+    csrf_token: str = Form(""),
     network_id: str = Form(""),
 ):
-    guard = role_guard(request, ("superadmin",))
+    guard = admin_post_guard(request, ("superadmin",), csrf_token)
     if guard:
         return guard
 
@@ -4491,7 +4545,8 @@ def admin_find(request: Request, q: str = ""):
     """
 
     if not q.strip():
-        return admin_page(
+        return render_admin_page(
+            request,
             "Поиск",
             form + '<div class="muted">Введите номер, MAC, IP или session ID.</div>',
             active_tab="find",
@@ -4612,7 +4667,7 @@ def admin_find(request: Request, q: str = ""):
     else:
         body += "<div class='muted'>Ничего не найдено.</div>"
 
-    return admin_page("Поиск", body, active_tab="find", role=role)    
+    return render_admin_page(request, "Поиск", body, active_tab="find", role=role)
 
 
 def build_system_tabs(section: str) -> str:
@@ -5190,7 +5245,7 @@ def admin_system(request: Request, section: str = "export", password_id: str = "
 
     body = tabs + content
 
-    return admin_page("Система", body, active_tab="system", role=role)
+    return render_admin_page(request, "Система", body, active_tab="system", role=role)
     
 
 @app.get("/admin/system/logs-stream")
@@ -5259,11 +5314,12 @@ def admin_system_logs_stream(request: Request, unit: str = "portal", level: str 
 @app.post("/admin/system/users/add")
 def admin_system_users_add(
     request: Request,
+    csrf_token: str = Form(""),
     username: str = Form(...),
     password: str = Form(...),
     role: str = Form(...),
 ):
-    guard = role_guard(request, ("superadmin",))
+    guard = admin_post_guard(request, ("superadmin",), csrf_token)
     if guard:
         return guard
 
@@ -5303,9 +5359,10 @@ def admin_system_users_add(
 @app.post("/admin/system/users/toggle")
 def admin_system_users_toggle(
     request: Request,
+    csrf_token: str = Form(""),
     user_id: int = Form(...)
 ):
-    guard = role_guard(request, ("superadmin",))
+    guard = admin_post_guard(request, ("superadmin",), csrf_token)
     if guard:
         return guard
 
@@ -5341,9 +5398,10 @@ def admin_system_users_toggle(
 @app.post("/admin/system/users/delete")
 def admin_system_users_delete(
     request: Request,
+    csrf_token: str = Form(""),
     user_id: int = Form(...)
 ):
-    guard = role_guard(request, ("superadmin",))
+    guard = admin_post_guard(request, ("superadmin",), csrf_token)
     if guard:
         return guard
 
@@ -5386,10 +5444,11 @@ def admin_system_users_delete(
 @app.post("/admin/system/users/password")
 def admin_system_users_password(
     request: Request,
+    csrf_token: str = Form(""),
     user_id: int = Form(...),
     password: str = Form(...)
 ):
-    guard = role_guard(request, ("superadmin",))
+    guard = admin_post_guard(request, ("superadmin",), csrf_token)
     if guard:
         return guard
 
@@ -5429,7 +5488,11 @@ def admin_export_xlsx(
     date_from: str | None = None,
     date_to: str | None = None
 ):
-    return _queue_export_job(request, table_name=table_name, fmt="xlsx", date_from=date_from, date_to=date_to)
+    guard = role_guard(request, ("superadmin",))
+    if guard:
+        return guard
+
+    return RedirectResponse(url="/admin/system?section=export", status_code=303)
 
 @app.get("/admin/export", response_class=HTMLResponse)
 def admin_export_page(request: Request, ok: str = ""):
@@ -5438,17 +5501,22 @@ def admin_export_page(request: Request, ok: str = ""):
         return guard
 
     username, role = get_current_admin_user(request)
-    return admin_page("Выгрузка", build_export_body(ok=ok), active_tab="export", role=role)
+    return render_admin_page(request, "Выгрузка", build_export_body(ok=ok), active_tab="export", role=role)
 
 
 @app.post("/admin/export/jobs")
 def admin_export_jobs_create(
     request: Request,
+    csrf_token: str = Form(""),
     table_name: str = Form("all"),
     fmt: str = Form("zip"),
     date_from: str | None = Form(None),
     date_to: str | None = Form(None),
 ):
+    guard = admin_post_guard(request, ("superadmin",), csrf_token)
+    if guard:
+        return guard
+
     return _queue_export_job(
         request,
         table_name=table_name,
@@ -5501,13 +5569,11 @@ def admin_export_download(
     date_from: str | None = None,
     date_to: str | None = None
 ):
-    return _queue_export_job(
-        request,
-        table_name=table_name,
-        fmt=fmt,
-        date_from=date_from,
-        date_to=date_to,
-    )
+    guard = role_guard(request, ("superadmin",))
+    if guard:
+        return guard
+
+    return RedirectResponse(url="/admin/system?section=export", status_code=303)
 
 
 @app.get("/admin/dashboard-data")
@@ -5847,7 +5913,8 @@ def admin_client(
             normalized_phone = phone
 
     if not phone and not mac and not guest_id:
-        return admin_page(
+        return render_admin_page(
+            request,
             "Карточка клиента",
             '<div class="muted">Не указан номер телефона или MAC-адрес.</div>',
             active_tab="sessions",
@@ -5883,7 +5950,8 @@ def admin_client(
     )
 
     if not sessions:
-        return admin_page(
+        return render_admin_page(
+            request,
             "Карточка клиента",
             '<div class="muted">Сессии по указанным данным не найдены.</div>',
             active_tab="sessions",
@@ -6002,7 +6070,7 @@ def admin_client(
         ]
     )
 
-    return admin_page("Карточка клиента", body, active_tab="sessions", role=role)
+    return render_admin_page(request, "Карточка клиента", body, active_tab="sessions", role=role)
 
 
 @app.post("/auth/dusit/room")
@@ -6031,8 +6099,11 @@ def auth_dusit_room(request: Request, payload: dict = Body(...)):
 
 
 @app.post("/admin/system/service/restart")
-def admin_service_restart(request: Request):
-    guard = role_guard(request, ("superadmin",))
+def admin_service_restart(
+    request: Request,
+    csrf_token: str = Form(""),
+):
+    guard = admin_post_guard(request, ("superadmin",), csrf_token)
     if guard:
         return guard
 

@@ -1,10 +1,11 @@
 from datetime import datetime, timezone
 from html import escape
+import re
 from urllib.parse import quote_plus
 
 from fastapi.responses import HTMLResponse
 
-from admin_auth import ROLE_IT, ROLE_RECEPTION, ROLE_SUPERADMIN, normalize_admin_role
+from admin_auth import ADMIN_CSRF_FIELD, ROLE_IT, ROLE_RECEPTION, ROLE_SUPERADMIN, normalize_admin_role
 from config import APP_VERSION
 from labels import (
     COLUMN_LABELS,
@@ -15,6 +16,23 @@ from labels import (
     TERMINATE_CAUSE_LABELS,
 )
 from services import DISPLAY_TZ
+
+
+POST_FORM_RE = re.compile(
+    r"(<form\b(?=[^>]*\bmethod\s*=\s*['\"]?post['\"]?)[^>]*>)",
+    re.IGNORECASE,
+)
+
+
+def inject_csrf_token(html: str, token: str) -> str:
+    if not token:
+        return html
+
+    hidden = (
+        f'\n            <input type="hidden" '
+        f'name="{ADMIN_CSRF_FIELD}" value="{escape(token, quote=True)}">'
+    )
+    return POST_FORM_RE.sub(lambda match: match.group(1) + hidden, html)
 
 
 def format_dt(value):
@@ -164,7 +182,13 @@ def html_table(rows, columns):
 
 
 
-def admin_page(title: str, body: str, active_tab: str = "", role: str = "admin") -> HTMLResponse:
+def admin_page(
+    title: str,
+    body: str,
+    active_tab: str = "",
+    role: str = "admin",
+    csrf_token: str = "",
+) -> HTMLResponse:
     role = normalize_admin_role(role)
 
     def nav_item(href: str, label: str, key: str) -> str:
@@ -242,5 +266,5 @@ def admin_page(title: str, body: str, active_tab: str = "", role: str = "admin")
     </body>
     </html>
     """
+    html = inject_csrf_token(html, csrf_token)
     return HTMLResponse(html)
-

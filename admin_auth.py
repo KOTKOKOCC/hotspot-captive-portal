@@ -6,13 +6,14 @@ import os
 import time
 from datetime import datetime, timezone
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import RedirectResponse
 
 from config import APP_SECRET, ADMIN_COOKIE
 
 
 ADMIN_SESSION_TTL_SECONDS = int(os.getenv("ADMIN_SESSION_TTL_SECONDS", str(60 * 60 * 8)))
+ADMIN_CSRF_FIELD = "csrf_token"
 
 ROLE_SUPERADMIN = "superadmin"
 ROLE_IT = "it"
@@ -111,6 +112,28 @@ def parse_admin_token(token: str):
 def get_current_admin_user(request: Request):
     token = request.cookies.get(ADMIN_COOKIE)
     return parse_admin_token(token)
+
+
+def make_admin_csrf_token(request: Request) -> str:
+    session_token = request.cookies.get(ADMIN_COOKIE, "")
+    username, role = parse_admin_token(session_token)
+
+    if not username or not role:
+        return ""
+
+    return f"v1.{_sign_payload('csrf.' + session_token)}"
+
+
+def verify_admin_csrf_token(request: Request, token: str | None) -> bool:
+    expected = make_admin_csrf_token(request)
+    supplied = str(token or "")
+
+    return bool(expected and supplied and hmac.compare_digest(supplied, expected))
+
+
+def require_admin_csrf(request: Request, token: str | None) -> None:
+    if not verify_admin_csrf_token(request, token):
+        raise HTTPException(status_code=403, detail="csrf_failed")
 
 
 def admin_guard(request: Request):

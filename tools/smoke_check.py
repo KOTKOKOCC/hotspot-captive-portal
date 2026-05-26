@@ -285,6 +285,123 @@ def check_admin_role_access_matrix() -> None:
     ok("admin role access matrix keeps reception, it, and superadmin separated")
 
 
+def check_admin_csrf_protection() -> None:
+    import tempfile
+    from datetime import datetime, timezone
+
+    from fastapi import HTTPException
+
+    import app_services.settings_store as settings_store
+    import db as db_module
+    from admin_auth import (
+        ADMIN_CSRF_FIELD,
+        ROLE_SUPERADMIN,
+        ensure_admin_users_table,
+        hash_admin_password,
+        make_admin_csrf_token,
+        make_admin_token,
+        verify_admin_csrf_token,
+    )
+    from config import ADMIN_COOKIE
+    from ui import admin_page
+
+    original_db_path = db_module.DB_PATH
+    original_settings_db_path = settings_store.DB_PATH
+
+    class FakeRequest:
+        def __init__(self, token: str):
+            self.cookies = {ADMIN_COOKIE: token}
+
+    def assert_csrf_forbidden(fn, label: str) -> None:
+        try:
+            fn()
+        except HTTPException as exc:
+            if exc.status_code == 403 and exc.detail == "csrf_failed":
+                return
+            fail(f"{label} expected csrf 403, got {exc.status_code}: {exc.detail}")
+        fail(f"{label} should be rejected by CSRF guard")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        test_db = Path(tmp) / "csrf.db"
+        db_module.DB_PATH = str(test_db)
+        settings_store.DB_PATH = str(test_db)
+
+        try:
+            ensure_admin_users_table()
+            now = datetime.now(timezone.utc).isoformat()
+            conn = db_module.db()
+            conn.execute(
+                """
+                INSERT INTO admin_users (
+                    username, password_hash, role, is_active, created_at, updated_at
+                )
+                VALUES (?, ?, ?, 1, ?, ?)
+                """,
+                ("csrf_super", hash_admin_password("password"), ROLE_SUPERADMIN, now, now),
+            )
+            conn.commit()
+            conn.close()
+
+            req = FakeRequest(make_admin_token("csrf_super", ROLE_SUPERADMIN))
+            csrf_token = make_admin_csrf_token(req)
+            if not csrf_token:
+                fail("CSRF token was not generated for a valid admin session")
+            if not verify_admin_csrf_token(req, csrf_token):
+                fail("valid CSRF token was rejected")
+            if verify_admin_csrf_token(req, "") or verify_admin_csrf_token(req, csrf_token + "x"):
+                fail("missing or tampered CSRF token was accepted")
+
+            html = admin_page(
+                "Тест",
+                '<form method="post" action="/admin/vouchers/create"></form>'
+                '<form method="get" action="/admin/find"></form>',
+                role=ROLE_SUPERADMIN,
+                csrf_token=csrf_token,
+            ).body.decode("utf-8")
+            if html.count(f'name="{ADMIN_CSRF_FIELD}"') != 1 or csrf_token not in html:
+                fail("admin POST forms did not receive exactly one CSRF hidden field")
+
+            from app import (
+                admin_export_download,
+                admin_export_full,
+                admin_export_jobs_create,
+                admin_export_period,
+                admin_export_xlsx,
+                admin_settings_radius_api,
+            )
+
+            for response in (
+                admin_export_full(req),
+                admin_export_period(req),
+                admin_export_xlsx(req, "guests"),
+                admin_export_download(req),
+            ):
+                if response.status_code != 303 or response.headers.get("location") != "/admin/system?section=export":
+                    fail("legacy GET export route did not redirect to the export page")
+
+            assert_csrf_forbidden(
+                lambda: admin_export_jobs_create(req),
+                "missing token on export job creation",
+            )
+            assert_csrf_forbidden(
+                lambda: admin_export_jobs_create(req, csrf_token="bad"),
+                "bad token on export job creation",
+            )
+
+            response = admin_settings_radius_api(
+                req,
+                csrf_token=csrf_token,
+                radius_allowed_ips="127.0.0.1",
+            )
+            if response.status_code != 303 or response.headers.get("location") != "/admin/system?section=settings&ok=radius":
+                fail("valid CSRF token did not allow a legitimate admin settings POST")
+        finally:
+            db_module.DB_PATH = original_db_path
+            settings_store.DB_PATH = original_settings_db_path
+
+    ok("admin CSRF tokens protect POST forms and handlers")
+
+
 def check_opera_lookup_fallback() -> None:
     import sqlite3
     import tempfile
@@ -1088,6 +1205,7 @@ def main() -> None:
     check_secrets(strict=args.strict_secrets)
     check_admin_tokens()
     check_admin_role_access_matrix()
+    check_admin_csrf_protection()
     check_opera_lookup_fallback()
     check_optional_api_guard()
     check_internal_api_guards()
