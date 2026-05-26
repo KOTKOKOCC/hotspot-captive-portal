@@ -137,6 +137,153 @@ def check_admin_tokens() -> None:
     ok("admin session tokens are signed, expiring, and database-backed")
 
 
+def check_admin_role_access_matrix() -> None:
+    import tempfile
+    from datetime import datetime, timezone
+
+    import db as db_module
+    from admin_auth import (
+        ROLE_IT,
+        ROLE_RECEPTION,
+        ROLE_SUPERADMIN,
+        ensure_admin_users_table,
+        hash_admin_password,
+        make_admin_token,
+        normalize_admin_role,
+        parse_admin_token,
+        role_guard,
+    )
+    from config import ADMIN_COOKIE
+    from ui import admin_page
+
+    original_db_path = db_module.DB_PATH
+
+    class FakeRequest:
+        def __init__(self, token: str):
+            self.cookies = {ADMIN_COOKIE: token}
+
+    def assert_denied_location(response, expected_location: str, label: str) -> None:
+        if response is None:
+            fail(f"{label} should be denied")
+        if response.status_code != 303 or response.headers.get("location") != expected_location:
+            fail(
+                f"{label} expected 303 -> {expected_location}, "
+                f"got {response.status_code} -> {response.headers.get('location')}"
+            )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        test_db = Path(tmp) / "roles.db"
+        db_module.DB_PATH = str(test_db)
+
+        try:
+            ensure_admin_users_table()
+            now = datetime.now(timezone.utc).isoformat()
+            conn = db_module.db()
+            for username, role in (
+                ("smoke_super", ROLE_SUPERADMIN),
+                ("smoke_it", ROLE_IT),
+                ("smoke_reception", ROLE_RECEPTION),
+                ("smoke_reseption", "reseption"),
+            ):
+                conn.execute(
+                    """
+                    INSERT INTO admin_users (
+                        username, password_hash, role, is_active, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, 1, ?, ?)
+                    """,
+                    (username, hash_admin_password("password"), role, now, now),
+                )
+            conn.commit()
+            conn.close()
+
+            super_req = FakeRequest(make_admin_token("smoke_super", ROLE_SUPERADMIN))
+            it_req = FakeRequest(make_admin_token("smoke_it", ROLE_IT))
+            reception_req = FakeRequest(make_admin_token("smoke_reception", ROLE_RECEPTION))
+            reseption_req = FakeRequest(make_admin_token("smoke_reseption", "reseption"))
+
+            if role_guard(super_req, (ROLE_SUPERADMIN,)) is not None:
+                fail("superadmin should pass superadmin-only guard")
+            assert_denied_location(
+                role_guard(it_req, (ROLE_SUPERADMIN,)),
+                "/admin?denied=1",
+                "it on superadmin-only guard",
+            )
+            assert_denied_location(
+                role_guard(reception_req, (ROLE_SUPERADMIN,)),
+                "/admin/vouchers?denied=1",
+                "reception on superadmin-only guard",
+            )
+            if role_guard(reseption_req, (ROLE_RECEPTION,)) is not None:
+                fail("reseption alias should pass reception guard")
+
+            from app import (
+                admin_export_jobs_create,
+                admin_system_logs_stream,
+                admin_system_service_status_json,
+                admin_voucher_remove_device,
+                admin_vouchers_create,
+            )
+
+            assert_denied_location(
+                admin_vouchers_create(
+                    it_req,
+                    full_name="Иванов Иван",
+                    passport="1234567890",
+                    birth_date="",
+                    phone="",
+                    site="",
+                    room_num="",
+                    max_devices=1,
+                    valid_days=1,
+                    document_type="rf_passport",
+                ),
+                "/admin?denied=1",
+                "it on voucher creation",
+            )
+            assert_denied_location(
+                admin_voucher_remove_device(reception_req, voucher_id=1, mac="AA:BB:CC:DD:EE:FF"),
+                "/admin/vouchers?denied=1",
+                "reception on voucher device removal",
+            )
+            assert_denied_location(
+                admin_export_jobs_create(it_req),
+                "/admin?denied=1",
+                "it on export creation",
+            )
+            assert_denied_location(
+                admin_system_logs_stream(it_req),
+                "/admin?denied=1",
+                "it on live logs stream",
+            )
+            status_json = admin_system_service_status_json(it_req)
+            if status_json != {"ok": False, "error": "forbidden"}:
+                fail("it should not access system service status JSON")
+
+            alias_username, alias_role = parse_admin_token(make_admin_token("smoke_reseption", "reseption"))
+            if alias_username != "smoke_reseption" or alias_role != ROLE_RECEPTION:
+                fail("reseption alias was not normalized to reception")
+
+            if normalize_admin_role("reseption") != ROLE_RECEPTION:
+                fail("role normalizer did not accept reseption alias")
+
+            reception_html = admin_page("Тест", "", role="reseption").body.decode("utf-8")
+            if "/admin/vouchers" not in reception_html or "/admin/guests" in reception_html:
+                fail("reception navigation should contain only vouchers and logout")
+
+            it_html = admin_page("Тест", "", role=ROLE_IT).body.decode("utf-8")
+            if "/admin/system" in it_html or "/admin/audit" in it_html:
+                fail("it navigation should not expose system or audit")
+
+            super_html = admin_page("Тест", "", role=ROLE_SUPERADMIN).body.decode("utf-8")
+            if "/admin/system" not in super_html or "/admin/audit" not in super_html:
+                fail("superadmin navigation should expose system and audit")
+        finally:
+            db_module.DB_PATH = original_db_path
+
+    ok("admin role access matrix keeps reception, it, and superadmin separated")
+
+
 def check_opera_lookup_fallback() -> None:
     import sqlite3
     import tempfile
@@ -840,6 +987,7 @@ def main() -> None:
     check_routes()
     check_secrets(strict=args.strict_secrets)
     check_admin_tokens()
+    check_admin_role_access_matrix()
     check_opera_lookup_fallback()
     check_optional_api_guard()
     check_internal_api_guards()

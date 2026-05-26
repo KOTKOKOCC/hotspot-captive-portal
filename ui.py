@@ -4,6 +4,7 @@ from urllib.parse import quote_plus
 
 from fastapi.responses import HTMLResponse
 
+from admin_auth import ROLE_IT, ROLE_RECEPTION, ROLE_SUPERADMIN, normalize_admin_role
 from config import APP_VERSION
 from labels import (
     COLUMN_LABELS,
@@ -164,17 +165,19 @@ def html_table(rows, columns):
 
 
 def admin_page(title: str, body: str, active_tab: str = "", role: str = "admin") -> HTMLResponse:
+    role = normalize_admin_role(role)
+
     def nav_item(href: str, label: str, key: str) -> str:
         cls = "active" if active_tab == key else ""
         return f'<a href="{href}" class="{cls}">{label}</a>'
 
-    if role == "reception":
+    if role == ROLE_RECEPTION:
         nav_html = "".join([
             nav_item("/admin/vouchers", "Ваучеры", "vouchers"),
             nav_item("/admin/logout", "Выход", "logout"),
         ])
 
-    elif role == "it":
+    elif role in (ROLE_IT, "admin"):
         nav_html = "".join([
             nav_item("/admin", "Главная", "home"),
             nav_item("/admin/guests", "Гости", "guests"),
@@ -185,8 +188,8 @@ def admin_page(title: str, body: str, active_tab: str = "", role: str = "admin")
             nav_item("/admin/find", "Поиск", "find"),
             nav_item("/admin/logout", "Выход", "logout"),
         ])
-    
-    else:
+
+    elif role == ROLE_SUPERADMIN:
         nav_html = "".join([
             nav_item("/admin", "Главная", "home"),
             nav_item("/admin/guests", "Гости", "guests"),
@@ -199,6 +202,9 @@ def admin_page(title: str, body: str, active_tab: str = "", role: str = "admin")
             nav_item("/admin/system", "Система", "system"),
             nav_item("/admin/logout", "Выход", "logout"),
         ])
+
+    else:
+        nav_html = nav_item("/admin/logout", "Выход", "logout")
     
     html = f"""
     <!doctype html>
@@ -237,5 +243,4 @@ def admin_page(title: str, body: str, active_tab: str = "", role: str = "admin")
     </html>
     """
     return HTMLResponse(html)
-
 

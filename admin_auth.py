@@ -14,6 +14,25 @@ from config import APP_SECRET, ADMIN_COOKIE
 
 ADMIN_SESSION_TTL_SECONDS = int(os.getenv("ADMIN_SESSION_TTL_SECONDS", str(60 * 60 * 8)))
 
+ROLE_SUPERADMIN = "superadmin"
+ROLE_IT = "it"
+ROLE_RECEPTION = "reception"
+ROLE_ALIASES = {
+    "reseption": ROLE_RECEPTION,
+}
+
+
+def normalize_admin_role(role: str | None) -> str:
+    raw = str(role or "").strip().lower()
+    return ROLE_ALIASES.get(raw, raw)
+
+
+def role_home_url(role: str | None, denied: bool = False) -> str:
+    role = normalize_admin_role(role)
+    if role == ROLE_RECEPTION:
+        return "/admin/vouchers?denied=1" if denied else "/admin/vouchers"
+    return "/admin?denied=1" if denied else "/admin"
+
 
 def _b64encode(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
@@ -37,7 +56,7 @@ def make_admin_token(username: str, role: str, ttl_seconds: int | None = None) -
     ttl = ADMIN_SESSION_TTL_SECONDS if ttl_seconds is None else int(ttl_seconds)
     payload = {
         "username": username,
-        "role": role,
+        "role": normalize_admin_role(role),
         "expires_at": int(time.time()) + ttl,
     }
     payload_raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -57,7 +76,7 @@ def _active_admin_role(username: str) -> str | None:
         """,
         (username,),
     )
-    return row["role"] if row else None
+    return normalize_admin_role(row["role"]) if row else None
 
 
 def parse_admin_token(token: str):
@@ -73,7 +92,7 @@ def parse_admin_token(token: str):
 
         payload = json.loads(_b64decode(payload_b64).decode("utf-8"))
         username = str(payload.get("username") or "")
-        role = str(payload.get("role") or "")
+        role = normalize_admin_role(payload.get("role"))
         expires_at = int(payload.get("expires_at") or 0)
 
         if not username or not role or time.time() > expires_at:
@@ -100,8 +119,8 @@ def admin_guard(request: Request):
     if not username:
         return RedirectResponse(url="/admin/login", status_code=303)
 
-    if role not in ("admin", "superadmin"):
-        return RedirectResponse(url="/admin?denied=1", status_code=303)
+    if role != ROLE_SUPERADMIN:
+        return RedirectResponse(url=role_home_url(role, denied=True), status_code=303)
         
     return None
 
@@ -112,8 +131,9 @@ def role_guard(request: Request, allowed_roles: tuple[str, ...]):
     if not username:
         return RedirectResponse(url="/admin/login", status_code=303)
 
-    if role not in allowed_roles:
-        return RedirectResponse(url="/admin?denied=1", status_code=303)
+    allowed = tuple(normalize_admin_role(item) for item in allowed_roles)
+    if role not in allowed:
+        return RedirectResponse(url=role_home_url(role, denied=True), status_code=303)
 
     return None
 

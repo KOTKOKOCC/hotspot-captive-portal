@@ -105,6 +105,9 @@ from config import (
 from api_security import ip_allowed, require_api_guard
 
 from admin_auth import (
+    ROLE_IT,
+    ROLE_RECEPTION,
+    ROLE_SUPERADMIN,
     make_admin_token,
     ADMIN_SESSION_TTL_SECONDS,
     admin_guard,
@@ -114,7 +117,14 @@ from admin_auth import (
     bootstrap_admin_users,
     verify_admin_password,
     hash_admin_password,
+    normalize_admin_role,
+    role_home_url,
 )
+
+SUPERADMIN_ROLES = (ROLE_SUPERADMIN,)
+ADMIN_VIEW_ROLES = (ROLE_SUPERADMIN, ROLE_IT, "admin")
+VOUCHER_VIEW_ROLES = (ROLE_SUPERADMIN, ROLE_IT, ROLE_RECEPTION, "admin")
+VOUCHER_ISSUE_ROLES = (ROLE_SUPERADMIN, ROLE_RECEPTION)
 
 
 from services import (
@@ -260,7 +270,7 @@ class RadiusAccountingIn(BaseModel):
 
 @app.get("/admin/system/disk")
 def admin_system_disk(request: Request):
-    guard = role_guard(request, ("admin", "superadmin", "it"))
+    guard = role_guard(request, SUPERADMIN_ROLES)
     if guard:
         return guard
 
@@ -474,7 +484,7 @@ def build_readiness_rows(service_statuses: dict[str, str]) -> str:
 
 @app.get("/admin/system/service/status-json")
 def admin_system_service_status_json(request: Request):
-    guard = role_guard(request, ("superadmin", "it"))
+    guard = role_guard(request, SUPERADMIN_ROLES)
     if guard:
         return {"ok": False, "error": "forbidden"}
 
@@ -1640,12 +1650,8 @@ def admin_login(username: str = Form(...), password: str = Form(...)):
     if not verify_admin_password(password, row["password_hash"]):
         return RedirectResponse(url="/admin/login?error=bad_credentials", status_code=303)
 
-    role = row["role"]
-
-    redirect_url = "/admin"
-
-    if role == "reception":
-        redirect_url = "/admin/vouchers"
+    role = normalize_admin_role(row["role"])
+    redirect_url = role_home_url(role)
 
     resp = RedirectResponse(url=redirect_url, status_code=303)
 
@@ -2444,7 +2450,7 @@ def radius_accounting(request: Request, payload: RadiusAccountingIn):
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_index(request: Request, denied: str = ""):
-    guard = role_guard(request, ("admin", "superadmin", "it"))
+    guard = role_guard(request, ADMIN_VIEW_ROLES)
     if guard:
         return guard
 
@@ -2873,7 +2879,7 @@ def admin_index(request: Request, denied: str = ""):
 @app.get("/admin/guests", response_class=HTMLResponse)
 def admin_guests(request: Request):
 
-    guard = role_guard(request, ("admin", "superadmin", "it"))
+    guard = role_guard(request, ADMIN_VIEW_ROLES)
     if guard:
         return guard
 
@@ -2947,7 +2953,7 @@ def admin_sessions(
     date_from: str = "",
     date_to: str = "",
 ):
-    guard = role_guard(request, ("admin", "superadmin", "it"))
+    guard = role_guard(request, ADMIN_VIEW_ROLES)
     if guard:
         return guard
 
@@ -3198,7 +3204,7 @@ def admin_sessions(
 @app.get("/admin/pending", response_class=HTMLResponse)
 def admin_pending(request: Request):
 
-    guard = role_guard(request, ("admin", "superadmin", "it"))
+    guard = role_guard(request, ADMIN_VIEW_ROLES)
     if guard:
         return guard
 
@@ -3213,7 +3219,7 @@ def admin_pending(request: Request):
 @app.get("/admin/calls", response_class=HTMLResponse)
 def admin_calls(request: Request):
 
-    guard = role_guard(request, ("admin", "superadmin", "it"))
+    guard = role_guard(request, ADMIN_VIEW_ROLES)
     if guard:
         return guard
 
@@ -3227,7 +3233,7 @@ def admin_calls(request: Request):
 
 @app.get("/admin/vouchers", response_class=HTMLResponse)
 def admin_vouchers(request: Request, error: str = "", ok: str = ""):
-    guard = role_guard(request, ("admin", "superadmin", "it", "reception"))
+    guard = role_guard(request, VOUCHER_VIEW_ROLES)
     if guard:
         return guard
 
@@ -3275,107 +3281,110 @@ def admin_vouchers(request: Request, error: str = "", ok: str = ""):
         r["code"] = decrypt_voucher_code(r.get("code_enc"))
         voucher_rows.append(r)
 
-    form = """
-    <div class="system-section voucher-create-panel">
-      <h2>Создание ваучера</h2>
+    form = ""
+    if role in VOUCHER_ISSUE_ROLES:
+        form = """
+        <div class="system-section voucher-create-panel">
+          <h2>Создание ваучера</h2>
 
-      <form class="voucher-form" method="post" action="/admin/vouchers/create">
+          <form class="voucher-form" method="post" action="/admin/vouchers/create">
 
-        <div class="voucher-form-row">
+            <div class="voucher-form-row">
 
-          <div>
-            <label class="required-label">ФИО гостя</label>
-            <input class="required-input"
-                   type="text"
-                   name="full_name"
-                   required
-                   placeholder="Иванов Иван Иванович">
-          </div>
+              <div>
+                <label class="required-label">ФИО гостя</label>
+                <input class="required-input"
+                       type="text"
+                       name="full_name"
+                       required
+                       placeholder="Иванов Иван Иванович">
+              </div>
 
-          <div>
-            <label class="required-label">Тип документа</label>
-            <select class="required-input"
-                    name="document_type"
-                    required>
-              <option value="rf_passport">Паспорт РФ</option>
-              <option value="foreign_passport">Загранпаспорт</option>
-            </select>
-          </div>
+              <div>
+                <label class="required-label">Тип документа</label>
+                <select class="required-input"
+                        name="document_type"
+                        required>
+                  <option value="rf_passport">Паспорт РФ</option>
+                  <option value="foreign_passport">Загранпаспорт</option>
+                </select>
+              </div>
 
-          <div>
-            <label class="required-label">Серия и номер</label>
-            <input class="required-input"
-                   type="text"
-                   name="passport"
-                   required
-                   placeholder="1234 567890">
-          </div>
+              <div>
+                <label class="required-label">Серия и номер</label>
+                <input class="required-input"
+                       type="text"
+                       name="passport"
+                       required
+                       placeholder="1234 567890">
+              </div>
 
-          <div>
-            <label>Телефон</label>
-            <input type="text"
-                   name="phone"
-                   placeholder="+7...">
-          </div>
+              <div>
+                <label>Телефон</label>
+                <input type="text"
+                       name="phone"
+                       placeholder="+7...">
+              </div>
 
-          <div>
-            <label>Дата рождения</label>
-            <input type="date"
-                   name="birth_date">
-          </div>
+              <div>
+                <label>Дата рождения</label>
+                <input type="date"
+                       name="birth_date">
+              </div>
 
-          <div>
-            <label>Объект</label>
-            <input type="text"
-                   name="site"
-                   placeholder="Dusit">
-          </div>
+              <div>
+                <label>Объект</label>
+                <input type="text"
+                       name="site"
+                       placeholder="Dusit">
+              </div>
 
-          <div>
-            <label>Комната</label>
-            <input type="text"
-                   name="room_num"
-                   placeholder="751">
-          </div>
+              <div>
+                <label>Комната</label>
+                <input type="text"
+                       name="room_num"
+                       placeholder="751">
+              </div>
 
-          <div>
-            <label>Устр.</label>
-            <input type="number"
-                   name="max_devices"
-                   value="1"
-                   min="1"
-                   max="3"
-                   required>
-          </div>
+              <div>
+                <label>Устр.</label>
+                <input type="number"
+                       name="max_devices"
+                       value="1"
+                       min="1"
+                       max="3"
+                       required>
+              </div>
 
-          <div>
-            <label>Дней</label>
-            <input type="number"
-                   name="valid_days"
-                   value="1"
-                   min="1"
-                   max="14"
-                   required>
-          </div>
+              <div>
+                <label>Дней</label>
+                <input type="number"
+                       name="valid_days"
+                       value="1"
+                       min="1"
+                       max="14"
+                       required>
+              </div>
 
+            </div>
+
+            <div class="voucher-submit-row">
+              <button class="btn primary voucher-submit-btn"
+                      type="submit">
+                Создать ваучер
+              </button>
+            </div>
+
+          </form>
         </div>
-
-        <div class="voucher-submit-row">
-          <button class="btn primary voucher-submit-btn"
-                  type="submit">
-            Создать ваучер
-          </button>
-        </div>
-
-      </form>
-    </div>
-    """
+        """
 
     body = msg_html + form
 
     body += "<h2 style='margin:18px 0 12px; font-size:22px;'>Последние ваучеры</h2>"
     
-    table_html = """
+    actions_header = "<th>Действия</th>" if role == ROLE_SUPERADMIN else ""
+    table_html = f"""
     <div style="overflow-x:auto;">
       <table class="table">
         <thead>
@@ -3391,7 +3400,7 @@ def admin_vouchers(request: Request, error: str = "", ok: str = ""):
             <th>Комната</th>
             <th>Кем создан</th>
             <th>Создан</th>
-            <th>Действия</th>
+            {actions_header}
           </tr>
         </thead>
         <tbody>
@@ -3419,12 +3428,14 @@ def admin_vouchers(request: Request, error: str = "", ok: str = ""):
         
         revoke_cell = ""
 
-        if role == "admin":
+        if role == ROLE_SUPERADMIN:
             revoke_cell = f"""
+              <td>
               <form method="post" action="/admin/vouchers/revoke" style="display:inline-flex; margin:0;" onsubmit="return confirm('Отключить ваучер? Дальнейший вход по нему будет запрещён.');">
                 <input type="hidden" name="voucher_id" value="{vid}">
                 <button class="btn" type="submit" {disabled}>{button_text}</button>
               </form>
+              </td>
             """
 
         table_html += f"""
@@ -3448,9 +3459,7 @@ def admin_vouchers(request: Request, error: str = "", ok: str = ""):
             <td>{escape(str(r.get("room_num") or ""))}</td>
             <td>{escape(str(r.get("created_by") or ""))}</td>
             <td>{escape(format_dt(r.get("created_at")))}</td>
-            <td>
-              {revoke_cell}
-            </td>
+            {revoke_cell}
           </tr>
         """
 
@@ -3478,7 +3487,7 @@ def admin_vouchers_create(
     valid_days: int = Form(1),
     document_type: str = Form(...),
 ):
-    guard = role_guard(request, ("admin", "superadmin", "it", "reception"))
+    guard = role_guard(request, VOUCHER_ISSUE_ROLES)
     if guard:
         return guard
 
@@ -3556,7 +3565,7 @@ def admin_vouchers_create(
 
 @app.get("/admin/vouchers/{voucher_id}", response_class=HTMLResponse)
 def admin_voucher_detail(request: Request, voucher_id: int):
-    guard = role_guard(request, ("admin", "superadmin", "it", "reception"))
+    guard = role_guard(request, VOUCHER_VIEW_ROLES)
     if guard:
         return guard
 
@@ -3579,7 +3588,8 @@ def admin_voucher_detail(request: Request, voucher_id: int):
         return admin_page(
             "Ваучер",
             "<div class='muted'>Ваучер не найден.</div>",
-            active_tab="vouchers"
+            active_tab="vouchers",
+            role=role,
         )
 
     devices = conn.execute("""
@@ -3608,25 +3618,9 @@ def admin_voucher_detail(request: Request, voucher_id: int):
     else:
         status_html = f'<span class="badge">{escape(status)}</span>'
 
-    device_rows = []
-    for d in devices:
-        device_rows.append({
-            "mac": d["mac"],
-            "ip": d["ip"],
-            "first_seen": format_dt(d["first_seen_at"]),
-            "last_seen": format_dt(d["last_seen_at"]),
-            "": f"""
-            <form method="post" action="/admin/vouchers/{voucher_id}/remove-device">
-                <input type="hidden" name="mac" value="{d['mac']}">
-                <button class="btn" style="height:32px;">Освободить</button>
-            </form>
-            """
-        })
-
-
     revoke_btn = ""
 
-    if role == "superadmin" and status == "active":
+    if role == ROLE_SUPERADMIN and status == "active":
         revoke_btn = f"""
         <form method="post" action="/admin/vouchers/revoke" style="display:inline-flex; margin:0;"
               onsubmit="return confirm('Отключить ваучер? Дальнейший вход по нему будет запрещён.');">
@@ -3683,7 +3677,8 @@ def admin_voucher_detail(request: Request, voucher_id: int):
     """
 
     if devices:
-        body += """
+        actions_header = "<th>Действия</th>" if role == ROLE_SUPERADMIN else ""
+        body += f"""
         <div style="overflow-x:auto;">
           <table class="table">
             <thead>
@@ -3692,7 +3687,7 @@ def admin_voucher_detail(request: Request, voucher_id: int):
                 <th>IP-адрес</th>
                 <th>Подключено</th>
                 <th>Последняя активность</th>
-                <th>Действия</th>
+                {actions_header}
               </tr>
             </thead>
             <tbody>
@@ -3700,12 +3695,9 @@ def admin_voucher_detail(request: Request, voucher_id: int):
 
         for d in devices:
             mac = str(d["mac"] or "")
-            body += f"""
-              <tr>
-                <td>{escape(mac)}</td>
-                <td>{escape(str(d["ip"] or ""))}</td>
-                <td>{escape(format_dt(d["first_seen_at"]))}</td>
-                <td>{escape(format_dt(d["last_seen_at"]))}</td>
+            remove_device_cell = ""
+            if role == ROLE_SUPERADMIN:
+                remove_device_cell = f"""
                 <td>
                   <form method="post" action="/admin/vouchers/{voucher_id}/remove-device" style="margin:0;"
                         onsubmit="return confirm('Освободить устройство {escape(mac)}?');">
@@ -3713,6 +3705,14 @@ def admin_voucher_detail(request: Request, voucher_id: int):
                     <button class="btn" type="submit">Освободить</button>
                   </form>
                 </td>
+                """
+            body += f"""
+              <tr>
+                <td>{escape(mac)}</td>
+                <td>{escape(str(d["ip"] or ""))}</td>
+                <td>{escape(format_dt(d["first_seen_at"]))}</td>
+                <td>{escape(format_dt(d["last_seen_at"]))}</td>
+                {remove_device_cell}
               </tr>
             """
 
@@ -3729,7 +3729,7 @@ def admin_voucher_detail(request: Request, voucher_id: int):
 
 @app.get("/admin/vouchers/{voucher_id}/print", response_class=HTMLResponse)
 def admin_voucher_print(request: Request, voucher_id: int):
-    guard = role_guard(request, ("admin", "superadmin", "it", "reception"))
+    guard = role_guard(request, VOUCHER_VIEW_ROLES)
     if guard:
         return guard
 
@@ -3885,7 +3885,7 @@ def admin_vouchers_revoke(
     request: Request,
     voucher_id: int = Form(...),
 ):
-    guard = role_guard(request, ("admin", "superadmin"))
+    guard = role_guard(request, SUPERADMIN_ROLES)
     if guard:
         return guard
 
@@ -3932,7 +3932,7 @@ def admin_voucher_remove_device(
     voucher_id: int,
     mac: str = Form(...),
 ):
-    guard = role_guard(request, ("admin", "superadmin", "it", "reception"))
+    guard = role_guard(request, SUPERADMIN_ROLES)
     if guard:
         return guard
 
@@ -3999,7 +3999,7 @@ def admin_networks(request: Request, error: str = "", ok: str = "", edit_id: str
     username, role = get_current_admin_user(request)
 
     body = build_networks_body(error=error, ok=ok, edit_id=edit_id)
-    return admin_page("Сети", body, active_tab="networks")
+    return admin_page("Сети", body, active_tab="networks", role=role)
 
 
 def build_networks_body(error: str = "", ok: str = "", edit_id: str = "", cancel_url: str = "/admin/networks"):
@@ -4439,7 +4439,7 @@ def admin_networks_delete(
 
 @app.get("/admin/find", response_class=HTMLResponse)
 def admin_find(request: Request, q: str = ""):
-    guard = role_guard(request, ("admin", "superadmin", "it"))
+    guard = role_guard(request, ADMIN_VIEW_ROLES)
     if guard:
         return guard
 
@@ -4797,7 +4797,7 @@ def admin_system(request: Request, section: str = "export", password_id: str = "
             <tr>
               <td>{int(u["id"])}</td>
               <td>{escape(str(u["username"]))}</td>
-              <td>{escape(str(u["role"]))}</td>
+              <td>{escape(normalize_admin_role(u["role"]))}</td>
               <td>{active_text}</td>
               <td>{escape(format_dt(u["created_at"]))}</td>
               <td>{escape(format_dt(u["updated_at"]))}</td>
@@ -5150,12 +5150,12 @@ def admin_system(request: Request, section: str = "export", password_id: str = "
 
     body = tabs + content
 
-    return admin_page("Система", body, active_tab="system")
+    return admin_page("Система", body, active_tab="system", role=role)
     
 
 @app.get("/admin/system/logs-stream")
 def admin_system_logs_stream(request: Request, unit: str = "portal", level: str = "all"):
-    guard = role_guard(request, ("superadmin", "it"))
+    guard = role_guard(request, SUPERADMIN_ROLES)
     if guard:
         return guard
 
@@ -5228,9 +5228,9 @@ def admin_system_users_add(
         return guard
 
     username = username.strip()
-    role = role.strip()
+    role = normalize_admin_role(role)
 
-    if role not in ("superadmin", "it", "reception"):
+    if role not in (ROLE_SUPERADMIN, ROLE_IT, ROLE_RECEPTION):
         return RedirectResponse(url="/admin/system?section=users&error=bad_role", status_code=303)
 
     if not username or not password:
@@ -5320,7 +5320,7 @@ def admin_system_users_delete(
     if str(user["username"]) == str(current_username):
         return RedirectResponse(url="/admin/system?section=users&error=self_delete", status_code=303)
 
-    if str(user["role"]) == "superadmin":
+    if normalize_admin_role(user["role"]) == ROLE_SUPERADMIN:
         cnt = fetch_one("""
             SELECT COUNT(*) AS cnt
             FROM admin_users
@@ -5398,7 +5398,7 @@ def admin_export_page(request: Request, ok: str = ""):
         return guard
 
     username, role = get_current_admin_user(request)
-    return admin_page("Выгрузка", build_export_body(ok=ok), active_tab="export")
+    return admin_page("Выгрузка", build_export_body(ok=ok), active_tab="export", role=role)
 
 
 @app.post("/admin/export/jobs")
@@ -5472,7 +5472,7 @@ def admin_export_download(
 
 @app.get("/admin/dashboard-data")
 def admin_dashboard_data(request: Request, period: str = "1d"):
-    guard = role_guard(request, ("admin", "superadmin", "it"))
+    guard = role_guard(request, ADMIN_VIEW_ROLES)
     if guard:
         return guard
 
@@ -5778,7 +5778,7 @@ def admin_client(
     mac: str = "",
     guest_id: int = 0,
 ):
-    guard = role_guard(request, ("admin", "superadmin", "it"))
+    guard = role_guard(request, ADMIN_VIEW_ROLES)
     if guard:
         return guard
 
@@ -5810,7 +5810,8 @@ def admin_client(
         return admin_page(
             "Карточка клиента",
             '<div class="muted">Не указан номер телефона или MAC-адрес.</div>',
-            active_tab="sessions"
+            active_tab="sessions",
+            role=role,
         )
 
     where = []
@@ -5845,7 +5846,8 @@ def admin_client(
         return admin_page(
             "Карточка клиента",
             '<div class="muted">Сессии по указанным данным не найдены.</div>',
-            active_tab="sessions"
+            active_tab="sessions",
+            role=role,
         )
 
     first = sessions[0]
