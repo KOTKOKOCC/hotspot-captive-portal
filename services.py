@@ -8,6 +8,8 @@ import logging
 
 from db import db
 from auth import now, now_iso, normalize_phone, normalize_mac
+from config import BASE_DIR
+from app_services.export_jobs import cleanup_export_job_files
 from app_services.settings_store import get_setting, set_setting
 
 DISPLAY_TZ = ZoneInfo("Europe/Moscow")
@@ -18,6 +20,9 @@ MIN_RETENTION_DAYS = 180
 DEFAULT_RETENTION_DAYS = 180
 DEFAULT_RETENTION_BATCH_SIZE = 5000
 DEFAULT_RETENTION_INTERVAL_HOURS = 24
+DEFAULT_EXPORT_FILE_RETENTION_DAYS = 7
+DEFAULT_EXPORT_FILE_CLEANUP_INTERVAL_HOURS = 6
+DEFAULT_EXPORT_FILE_CLEANUP_BATCH_SIZE = 200
 
 
 TERMINATE_CAUSE_ALIASES = {
@@ -457,6 +462,31 @@ def get_retention_config() -> dict:
     }
 
 
+def get_export_file_cleanup_config() -> dict:
+    return {
+        "enabled": str(get_setting("export.cleanup_enabled", "1")) == "1",
+        "days": _int_setting(
+            "export.files_retention_days",
+            DEFAULT_EXPORT_FILE_RETENTION_DAYS,
+            minimum=1,
+            maximum=30,
+        ),
+        "batch_size": _int_setting(
+            "export.cleanup_batch_size",
+            DEFAULT_EXPORT_FILE_CLEANUP_BATCH_SIZE,
+            minimum=10,
+            maximum=5000,
+        ),
+        "interval_hours": _int_setting(
+            "export.cleanup_interval_hours",
+            DEFAULT_EXPORT_FILE_CLEANUP_INTERVAL_HOURS,
+            minimum=1,
+            maximum=168,
+        ),
+        "last_run": str(get_setting("export.cleanup_last_run", "") or ""),
+    }
+
+
 def _parse_dt(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -591,6 +621,28 @@ def run_retention_cleanup(force: bool = False) -> dict:
     }
 
 
+def run_export_file_cleanup(force: bool = False) -> dict:
+    config = get_export_file_cleanup_config()
+    if not config["enabled"] and not force:
+        return {"ran": False, "expired_jobs": 0, "files_deleted": 0}
+
+    if not force and not _retention_due(config["last_run"], config["interval_hours"]):
+        return {"ran": False, "expired_jobs": 0, "files_deleted": 0}
+
+    stats = cleanup_export_job_files(
+        BASE_DIR / "export_jobs",
+        retention_days=config["days"],
+        batch_size=config["batch_size"],
+    )
+    set_setting("export.cleanup_last_run", now_iso())
+
+    return {
+        "ran": True,
+        "cutoff_days": config["days"],
+        **stats,
+    }
+
+
 def cleanup_db():
     conn = db()
     current = now()
@@ -687,12 +739,16 @@ def run_cleanup():
     pending_stats = cleanup_db()
     stale_sessions_closed = cleanup_stale_sessions()
     retention_stats = run_retention_cleanup()
+    export_cleanup_stats = run_export_file_cleanup()
     return {
         "pending_expired": pending_stats["expired"],
         "pending_deleted": pending_stats["deleted"],
         "stale_sessions_closed": stale_sessions_closed,
         "retention_checked": 1 if retention_stats.get("ran") else 0,
         "retention_deleted": int(retention_stats.get("deleted") or 0),
+        "export_cleanup_checked": 1 if export_cleanup_stats.get("ran") else 0,
+        "export_files_deleted": int(export_cleanup_stats.get("files_deleted") or 0),
+        "export_jobs_expired": int(export_cleanup_stats.get("expired_jobs") or 0),
     }
 
 

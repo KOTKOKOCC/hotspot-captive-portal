@@ -177,7 +177,8 @@ def check_admin_role_access_matrix() -> None:
 
         try:
             ensure_admin_users_table()
-            now = datetime.now(timezone.utc).isoformat()
+            now_dt = datetime.now(timezone.utc)
+            now = now_dt.isoformat()
             conn = db_module.db()
             for username, role in (
                 ("smoke_super", ROLE_SUPERADMIN),
@@ -854,12 +855,13 @@ def check_export_jobs() -> None:
     import os
     import subprocess
     import tempfile
-    from datetime import datetime, timezone
+    from datetime import datetime, timedelta, timezone
     from zipfile import ZipFile
 
     import app_services.settings_store as settings_store
     import db as db_module
     from app_services.export_jobs import (
+        cleanup_export_job_files,
         create_export_job,
         get_export_job,
         init_export_jobs_table,
@@ -881,7 +883,8 @@ def check_export_jobs() -> None:
         try:
             init_db()
             init_export_jobs_table()
-            now = datetime.now(timezone.utc).isoformat()
+            now_dt = datetime.now(timezone.utc)
+            now = now_dt.isoformat()
 
             conn = db_module.db()
             conn.execute("""
@@ -946,11 +949,45 @@ def check_export_jobs() -> None:
                 fail("export job worker did not mark job as done")
             if not Path(process_job["file_path"]).exists():
                 fail("export job worker did not create output file")
+
+            old_file = Path(tmp) / "old_export.xlsx"
+            recent_file = Path(tmp) / "recent_export.xlsx"
+            old_file.write_text("old export", encoding="utf-8")
+            recent_file.write_text("recent export", encoding="utf-8")
+
+            old_job_id = create_export_job("smoke", "guests", "xlsx")
+            recent_job_id = create_export_job("smoke", "guests", "xlsx")
+            mark_export_job_done(old_job_id, old_file, old_file.name)
+            mark_export_job_done(recent_job_id, recent_file, recent_file.name)
+
+            old_dt = now_dt - timedelta(days=8)
+            old_ts = old_dt.isoformat()
+            conn = db_module.db()
+            conn.execute(
+                "UPDATE export_jobs SET finished_at = ?, created_at = ? WHERE id = ?",
+                (old_ts, old_ts, old_job_id),
+            )
+            conn.commit()
+            conn.close()
+
+            old_log = Path(tmp) / "export_job_999.log"
+            old_log.write_text("old log", encoding="utf-8")
+            os.utime(old_log, (old_dt.timestamp(), old_dt.timestamp()))
+
+            cleanup_stats = cleanup_export_job_files(Path(tmp), retention_days=7, now_dt=now_dt)
+            if cleanup_stats["expired_jobs"] != 1 or cleanup_stats["files_deleted"] != 1:
+                fail(f"export cleanup should expire one old export file, got {cleanup_stats}")
+            if old_file.exists() or not recent_file.exists() or old_log.exists():
+                fail("export cleanup did not remove only old export artifacts")
+            if get_export_job(old_job_id)["status"] != "expired":
+                fail("export cleanup did not mark old export job as expired")
+            if get_export_job(recent_job_id)["status"] != "done":
+                fail("export cleanup expired a recent export job")
         finally:
             db_module.DB_PATH = original_db_path
             settings_store.DB_PATH = original_settings_db_path
 
-    ok("export jobs are persisted and worker creates files outside the web request")
+    ok("export jobs are persisted, run in workers, and old files are cleaned up")
 
 
 def fetch_no_redirect(url: str):

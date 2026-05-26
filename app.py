@@ -132,7 +132,10 @@ from services import (
     MIN_RETENTION_DAYS,
     DEFAULT_RETENTION_DAYS,
     DEFAULT_RETENTION_BATCH_SIZE,
+    DEFAULT_EXPORT_FILE_RETENTION_DAYS,
+    DEFAULT_EXPORT_FILE_CLEANUP_BATCH_SIZE,
     get_retention_config,
+    get_export_file_cleanup_config,
     normalize_accounting_event_time,
     resolve_network_info,
     audit,
@@ -215,6 +218,12 @@ def ensure_security_default_settings() -> None:
         set_setting("retention.batch_size", DEFAULT_RETENTION_BATCH_SIZE)
     if get_setting("auth.reauth_days", None) is None:
         set_setting("auth.reauth_days", DEFAULT_REAUTH_DAYS)
+    if get_setting("export.cleanup_enabled", None) is None:
+        set_setting("export.cleanup_enabled", "1")
+    if get_setting("export.files_retention_days", None) is None:
+        set_setting("export.files_retention_days", DEFAULT_EXPORT_FILE_RETENTION_DAYS)
+    if get_setting("export.cleanup_batch_size", None) is None:
+        set_setting("export.cleanup_batch_size", DEFAULT_EXPORT_FILE_CLEANUP_BATCH_SIZE)
 
 
 def mask_phone(phone: str | None) -> str:
@@ -400,6 +409,7 @@ def build_readiness_rows(service_statuses: dict[str, str]) -> str:
     pbx_enabled = str(get_setting("pbx.enabled", "1")) == "1"
     pbx_allowed_ips = csv_setting_items("pbx.allowed_ips", PBX_ALLOWED_IPS)
     retention_config = get_retention_config()
+    export_cleanup_config = get_export_file_cleanup_config()
 
     last_radius = get_last_radius_event()
     opera_status = get_opera_fias_status()
@@ -464,6 +474,14 @@ def build_readiness_rows(service_statuses: dict[str, str]) -> str:
         if retention_config["enabled"]
         else "disabled",
         "/admin/system?section=settings",
+    )
+    add(
+        "Export files",
+        "ok" if export_cleanup_config["enabled"] else "warn",
+        f"cleanup enabled, files kept {export_cleanup_config['days']} days"
+        if export_cleanup_config["enabled"]
+        else "cleanup disabled",
+        "/admin/system?section=export",
     )
     add(
         "Last RADIUS request",
@@ -4599,6 +4617,7 @@ def build_system_tabs(section: str) -> str:
 
 
 def build_export_body(ok: str = "") -> str:
+    cleanup_config = get_export_file_cleanup_config()
     table_labels = {
         "all": "Все таблицы",
         "guests": "Гости",
@@ -4613,6 +4632,7 @@ def build_export_body(ok: str = "") -> str:
         "running": "в работе",
         "done": "готово",
         "failed": "ошибка",
+        "expired": "файл удалён",
     }
 
     rows_html = ""
@@ -4620,7 +4640,13 @@ def build_export_body(ok: str = "") -> str:
         job_id = int(job["id"])
         status = str(job["status"] or "")
         status_text = status_labels.get(status, status)
-        status_class = "active" if status == "done" else "pending" if status in ("queued", "running") else "error"
+        status_class = (
+            "active"
+            if status == "done"
+            else "pending"
+            if status in ("queued", "running", "expired")
+            else "error"
+        )
         period = f'{job["date_from"] or "start"} - {job["date_to"] or "end"}'
 
         download_html = ""
@@ -4699,6 +4725,7 @@ def build_export_body(ok: str = "") -> str:
 
       <div class="muted">
         Полная выгрузка создаётся в отдельном процессе. Страница портала не ждёт сборку файла и не должна зависать.
+        Готовые файлы автоматически удаляются через {int(cleanup_config["days"])} дн.; исходные данные остаются в базе по сроку хранения.
       </div>
 
       <h3 style="margin-top:18px;">Последние выгрузки</h3>
