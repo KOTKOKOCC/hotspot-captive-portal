@@ -1,14 +1,16 @@
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 import ipaddress
 import json
+import sqlite3
 import time
 import threading
 import logging
 
 from db import db
 from auth import now, now_iso, normalize_phone, normalize_mac
-from config import BASE_DIR
+from config import BASE_DIR, DB_PATH
 from app_services.export_jobs import cleanup_export_job_files
 from app_services.settings_store import get_setting, set_setting
 
@@ -23,6 +25,8 @@ DEFAULT_RETENTION_INTERVAL_HOURS = 24
 DEFAULT_EXPORT_FILE_RETENTION_DAYS = 7
 DEFAULT_EXPORT_FILE_CLEANUP_INTERVAL_HOURS = 6
 DEFAULT_EXPORT_FILE_CLEANUP_BATCH_SIZE = 200
+DEFAULT_BACKUP_CHECK_MAX_AGE_HOURS = 36
+DEFAULT_BACKUP_PREFIX = "hotspot-db"
 
 
 TERMINATE_CAUSE_ALIASES = {
@@ -484,6 +488,166 @@ def get_export_file_cleanup_config() -> dict:
             maximum=168,
         ),
         "last_run": str(get_setting("export.cleanup_last_run", "") or ""),
+    }
+
+
+def _resolve_app_path(value: str | Path) -> Path:
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    return BASE_DIR / path
+
+
+def get_backup_check_config() -> dict:
+    return {
+        "enabled": str(get_setting("backup.check_enabled", "1")) == "1",
+        "dest_dir": str(get_setting("backup.dest_dir", str(BASE_DIR / "backups" / "db")) or ""),
+        "prefix": str(get_setting("backup.prefix", DEFAULT_BACKUP_PREFIX) or DEFAULT_BACKUP_PREFIX),
+        "max_age_hours": _int_setting(
+            "backup.max_age_hours",
+            DEFAULT_BACKUP_CHECK_MAX_AGE_HOURS,
+            minimum=1,
+            maximum=168,
+        ),
+    }
+
+
+def _human_bytes(value: int) -> str:
+    units = ("B", "KB", "MB", "GB", "TB")
+    size = float(value)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return f"{value} B"
+
+
+def _find_latest_backup_db(dest_dir: Path, prefix: str) -> tuple[Path | None, Path | None]:
+    if not dest_dir.exists() or not dest_dir.is_dir():
+        return None, None
+
+    backup_dirs = sorted(
+        (
+            path
+            for path in dest_dir.iterdir()
+            if path.is_dir() and path.name.startswith(f"{prefix}-")
+        ),
+        key=lambda path: (path.stat().st_mtime, path.name),
+        reverse=True,
+    )
+    if not backup_dirs:
+        return None, None
+
+    db_name = Path(DB_PATH).name
+    for backup_dir in backup_dirs:
+        expected = backup_dir / db_name
+        if expected.is_file():
+            return backup_dir, expected
+
+        db_candidates = sorted(
+            path
+            for path in backup_dir.iterdir()
+            if path.is_file()
+            and path.suffix.lower() in (".db", ".sqlite", ".sqlite3")
+            and not path.name.endswith(("-wal", "-shm"))
+        )
+        if db_candidates:
+            return backup_dir, db_candidates[0]
+
+    return backup_dirs[0], None
+
+
+def _sqlite_integrity_status(path: Path) -> dict:
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        try:
+            rows = [str(row[0]) for row in conn.execute("PRAGMA integrity_check").fetchall()]
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {"ok": False, "text": f"integrity error: {exc}"}
+
+    if rows == ["ok"]:
+        return {"ok": True, "text": "integrity ok"}
+
+    return {"ok": False, "text": "; ".join(rows[:3]) or "integrity failed"}
+
+
+def get_backup_status(timer_status: str | None = None, now_dt: datetime | None = None) -> dict:
+    config = get_backup_check_config()
+    if not config["enabled"]:
+        return {
+            "status": "warn",
+            "details": "backup check disabled",
+            "enabled": False,
+            "timer_status": timer_status or "",
+        }
+
+    dest_dir = _resolve_app_path(config["dest_dir"])
+    current = now_dt or datetime.now(timezone.utc)
+    backup_dir, backup_db = _find_latest_backup_db(dest_dir, config["prefix"])
+
+    if backup_db is None:
+        return {
+            "status": "bad",
+            "details": f"no backup database found in {dest_dir}",
+            "enabled": True,
+            "timer_status": timer_status or "",
+        }
+
+    try:
+        stat = backup_db.stat()
+    except OSError as exc:
+        return {
+            "status": "bad",
+            "details": f"backup database is not readable: {exc}",
+            "enabled": True,
+            "backup_db": str(backup_db),
+            "timer_status": timer_status or "",
+        }
+
+    backup_dt = datetime.fromtimestamp(stat.st_mtime, timezone.utc)
+    age_hours = max(0.0, (current - backup_dt).total_seconds() / 3600)
+    integrity = _sqlite_integrity_status(backup_db)
+    timer_ok = timer_status in (None, "", "active")
+    fresh = age_hours <= int(config["max_age_hours"])
+
+    status = "ok"
+    problems = []
+    if not integrity["ok"]:
+        status = "bad"
+        problems.append(integrity["text"])
+    if not fresh:
+        status = "warn" if status == "ok" else status
+        problems.append(f"age {age_hours:.1f}h > {int(config['max_age_hours'])}h")
+    if not timer_ok:
+        status = "warn" if status == "ok" else status
+        problems.append(f"timer {timer_status}")
+
+    details_parts = [
+        f"last {backup_dt.isoformat()}",
+        f"age {age_hours:.1f}h",
+        _human_bytes(stat.st_size),
+        integrity["text"],
+    ]
+    if timer_status:
+        details_parts.append(f"timer {timer_status}")
+    if problems:
+        details_parts.append("attention: " + ", ".join(problems))
+
+    return {
+        "status": status,
+        "details": ", ".join(details_parts),
+        "enabled": True,
+        "dest_dir": str(dest_dir),
+        "backup_dir": str(backup_dir or ""),
+        "backup_db": str(backup_db),
+        "backup_at": backup_dt.isoformat(),
+        "age_hours": age_hours,
+        "size_bytes": stat.st_size,
+        "integrity_ok": integrity["ok"],
+        "integrity": integrity["text"],
+        "timer_status": timer_status or "",
     }
 
 

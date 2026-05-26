@@ -851,6 +851,69 @@ def check_retention_cleanup() -> None:
     ok("retention cleanup keeps at least 180 days and deletes older personal records")
 
 
+def check_backup_status() -> None:
+    import os
+    import sqlite3
+    import tempfile
+    from datetime import datetime, timezone
+
+    import app_services.settings_store as settings_store
+    import db as db_module
+    import services
+    from app_services.settings_store import init_settings_table, set_setting
+
+    original_db_path = db_module.DB_PATH
+    original_settings_db_path = settings_store.DB_PATH
+
+    with tempfile.TemporaryDirectory() as tmp:
+        settings_db = Path(tmp) / "settings.db"
+        backup_root = Path(tmp) / "backups" / "db"
+        db_module.DB_PATH = str(settings_db)
+        settings_store.DB_PATH = str(settings_db)
+
+        try:
+            init_settings_table()
+            set_setting("backup.dest_dir", str(backup_root))
+            set_setting("backup.max_age_hours", 36)
+
+            missing = services.get_backup_status(timer_status="inactive")
+            if missing["status"] != "bad":
+                fail(f"missing backup should be bad, got {missing}")
+
+            now_dt = datetime.now(timezone.utc)
+            backup_dir = backup_root / "hotspot-db-20260526-033000"
+            backup_dir.mkdir(parents=True)
+            backup_db = backup_dir / "hotspot.db"
+            conn = sqlite3.connect(backup_db)
+            conn.execute("CREATE TABLE smoke (id INTEGER PRIMARY KEY, value TEXT)")
+            conn.execute("INSERT INTO smoke (value) VALUES ('ok')")
+            conn.commit()
+            conn.close()
+            os.utime(backup_dir, (now_dt.timestamp(), now_dt.timestamp()))
+            os.utime(backup_db, (now_dt.timestamp(), now_dt.timestamp()))
+
+            healthy = services.get_backup_status(timer_status="active", now_dt=now_dt)
+            if healthy["status"] != "ok" or not healthy.get("integrity_ok"):
+                fail(f"healthy backup should pass integrity check, got {healthy}")
+
+            broken_dir = backup_root / "hotspot-db-20260526-040000"
+            broken_dir.mkdir()
+            broken_db = broken_dir / "hotspot.db"
+            broken_db.write_text("not sqlite", encoding="utf-8")
+            newer_ts = now_dt.timestamp() + 60
+            os.utime(broken_dir, (newer_ts, newer_ts))
+            os.utime(broken_db, (newer_ts, newer_ts))
+
+            broken = services.get_backup_status(timer_status="active", now_dt=now_dt)
+            if broken["status"] != "bad" or broken.get("integrity_ok"):
+                fail(f"broken backup should fail integrity check, got {broken}")
+        finally:
+            db_module.DB_PATH = original_db_path
+            settings_store.DB_PATH = original_settings_db_path
+
+    ok("backup readiness checks freshness and SQLite integrity without restore")
+
+
 def check_export_jobs() -> None:
     import os
     import subprocess
@@ -1033,6 +1096,7 @@ def main() -> None:
     check_pms_check_result_renderer()
     check_reauth_window_setting()
     check_retention_cleanup()
+    check_backup_status()
     check_export_jobs()
 
     if args.base_url:

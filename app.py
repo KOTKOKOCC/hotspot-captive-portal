@@ -134,8 +134,10 @@ from services import (
     DEFAULT_RETENTION_BATCH_SIZE,
     DEFAULT_EXPORT_FILE_RETENTION_DAYS,
     DEFAULT_EXPORT_FILE_CLEANUP_BATCH_SIZE,
+    DEFAULT_BACKUP_CHECK_MAX_AGE_HOURS,
     get_retention_config,
     get_export_file_cleanup_config,
+    get_backup_status,
     normalize_accounting_event_time,
     resolve_network_info,
     audit,
@@ -224,6 +226,10 @@ def ensure_security_default_settings() -> None:
         set_setting("export.files_retention_days", DEFAULT_EXPORT_FILE_RETENTION_DAYS)
     if get_setting("export.cleanup_batch_size", None) is None:
         set_setting("export.cleanup_batch_size", DEFAULT_EXPORT_FILE_CLEANUP_BATCH_SIZE)
+    if get_setting("backup.check_enabled", None) is None:
+        set_setting("backup.check_enabled", "1")
+    if get_setting("backup.max_age_hours", None) is None:
+        set_setting("backup.max_age_hours", DEFAULT_BACKUP_CHECK_MAX_AGE_HOURS)
 
 
 def mask_phone(phone: str | None) -> str:
@@ -410,6 +416,7 @@ def build_readiness_rows(service_statuses: dict[str, str]) -> str:
     pbx_allowed_ips = csv_setting_items("pbx.allowed_ips", PBX_ALLOWED_IPS)
     retention_config = get_retention_config()
     export_cleanup_config = get_export_file_cleanup_config()
+    backup_status = get_backup_status(service_statuses.get("backup_timer"))
 
     last_radius = get_last_radius_event()
     opera_status = get_opera_fias_status()
@@ -484,6 +491,12 @@ def build_readiness_rows(service_statuses: dict[str, str]) -> str:
         "/admin/system?section=export",
     )
     add(
+        "Database backup",
+        str(backup_status.get("status") or "warn"),
+        str(backup_status.get("details") or "backup status unknown"),
+        "/admin/system?section=service",
+    )
+    add(
         "Last RADIUS request",
         "ok" if last_radius["event_time"] else "warn",
         f"{format_dt(last_radius['event_time'])} / {last_radius['event_type']}"
@@ -518,6 +531,7 @@ def admin_system_service_status_json(request: Request):
         ("mikrotik", "hotspot-mikrotik-sync-worker.service"),
         ("opera", "opera-fias-sync.service"),
         ("freeradius", "freeradius.service"),
+        ("backup_timer", "hotspot-db-backup.timer"),
     ]
 
     return {
@@ -4911,6 +4925,7 @@ def admin_system(request: Request, section: str = "export", password_id: str = "
             ("MikroTik sync", "mikrotik", "hotspot-mikrotik-sync-worker.service"),
             ("Opera FIAS", "opera", "opera-fias-sync.service"),
             ("FreeRADIUS", "freeradius", "freeradius.service"),
+            ("DB backup timer", "backup_timer", "hotspot-db-backup.timer"),
         ]
 
         service_statuses = {

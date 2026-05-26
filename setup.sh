@@ -559,10 +559,36 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
+  cat > /etc/systemd/system/hotspot-db-backup.service <<EOF
+[Unit]
+Description=Hotspot SQLite database backup
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=$PROJECT_DIR
+EnvironmentFile=$PROJECT_DIR/.env
+ExecStart=$PROJECT_DIR/.venv/bin/python $PROJECT_DIR/tools/backup_sqlite.py --dest-dir $PROJECT_DIR/backups/db --keep 7 --include-env
+EOF
+
+  cat > /etc/systemd/system/hotspot-db-backup.timer <<EOF
+[Unit]
+Description=Run Hotspot SQLite database backup nightly
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=30m
+
+[Install]
+WantedBy=timers.target
+EOF
+
   chmod 644 \
     /etc/systemd/system/hotspot-captive-portal.service \
     /etc/systemd/system/hotspot-cleanup-worker.service \
-    /etc/systemd/system/hotspot-mikrotik-sync-worker.service
+    /etc/systemd/system/hotspot-mikrotik-sync-worker.service \
+    /etc/systemd/system/hotspot-db-backup.service \
+    /etc/systemd/system/hotspot-db-backup.timer
 
   echo "Installed systemd units for $PROJECT_DIR"
 }
@@ -922,7 +948,7 @@ else
 fi
 
 ensure_runtime_env_defaults
-mkdir -p backups docs deploy workers tools opera
+mkdir -p backups/db docs deploy workers tools opera
 
 echo
 echo "[4/6] Installing systemd services"
@@ -954,6 +980,7 @@ systemctl daemon-reload
 systemctl enable hotspot-captive-portal.service
 systemctl enable hotspot-cleanup-worker.service
 systemctl enable hotspot-mikrotik-sync-worker.service
+systemctl enable --now hotspot-db-backup.timer
 
 systemctl restart hotspot-captive-portal.service
 systemctl restart hotspot-cleanup-worker.service
