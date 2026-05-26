@@ -107,6 +107,33 @@ def check_secrets(strict: bool) -> None:
         ok("application secrets are not default placeholders")
 
 
+def check_app_version_source() -> None:
+    import importlib
+    import os
+
+    import config
+
+    original = os.environ.get("APP_VERSION")
+    expected = (PROJECT_ROOT / "VERSION").read_text(encoding="utf-8").strip()
+
+    try:
+        os.environ["APP_VERSION"] = "0.0.0-stale-env"
+        reloaded = importlib.reload(config)
+        if reloaded.APP_VERSION != expected:
+            fail(
+                "APP_VERSION should come from VERSION file, "
+                f"got {reloaded.APP_VERSION!r}, expected {expected!r}"
+            )
+    finally:
+        if original is None:
+            os.environ.pop("APP_VERSION", None)
+        else:
+            os.environ["APP_VERSION"] = original
+        importlib.reload(config)
+
+    ok("web UI version is read from VERSION, not stale environment")
+
+
 def check_admin_tokens() -> None:
     from admin_auth import (
         bootstrap_admin_users,
@@ -1334,6 +1361,7 @@ def main() -> None:
 
     check_routes()
     check_secrets(strict=args.strict_secrets)
+    check_app_version_source()
     check_admin_tokens()
     check_admin_role_access_matrix()
     check_admin_csrf_protection()

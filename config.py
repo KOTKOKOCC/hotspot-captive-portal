@@ -31,7 +31,7 @@ def _read_app_version() -> str:
 
 
 APP_NAME = os.getenv("APP_NAME", "C-Portal")
-APP_VERSION = os.getenv("APP_VERSION", _read_app_version())
+APP_VERSION = _read_app_version()
 DB_PATH = os.getenv("DB_PATH", str(BASE_DIR / "hotspot.db"))
 OPERA_CACHE_DB_PATH = os.getenv(
     "OPERA_CACHE_DB_PATH",
