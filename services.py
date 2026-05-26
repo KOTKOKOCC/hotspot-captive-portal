@@ -573,14 +573,13 @@ def _sqlite_integrity_status(path: Path) -> dict:
     return {"ok": False, "text": "; ".join(rows[:3]) or "integrity failed"}
 
 
-def get_backup_status(timer_status: str | None = None, now_dt: datetime | None = None) -> dict:
+def get_backup_status(now_dt: datetime | None = None) -> dict:
     config = get_backup_check_config()
     if not config["enabled"]:
         return {
             "status": "warn",
             "details": "backup check disabled",
             "enabled": False,
-            "timer_status": timer_status or "",
         }
 
     dest_dir = _resolve_app_path(config["dest_dir"])
@@ -589,10 +588,9 @@ def get_backup_status(timer_status: str | None = None, now_dt: datetime | None =
 
     if backup_db is None:
         return {
-            "status": "bad",
+            "status": "warn",
             "details": f"no backup database found in {dest_dir}",
             "enabled": True,
-            "timer_status": timer_status or "",
         }
 
     try:
@@ -603,13 +601,11 @@ def get_backup_status(timer_status: str | None = None, now_dt: datetime | None =
             "details": f"backup database is not readable: {exc}",
             "enabled": True,
             "backup_db": str(backup_db),
-            "timer_status": timer_status or "",
         }
 
     backup_dt = datetime.fromtimestamp(stat.st_mtime, timezone.utc)
     age_hours = max(0.0, (current - backup_dt).total_seconds() / 3600)
     integrity = _sqlite_integrity_status(backup_db)
-    timer_ok = timer_status in (None, "", "active")
     fresh = age_hours <= int(config["max_age_hours"])
 
     status = "ok"
@@ -620,9 +616,6 @@ def get_backup_status(timer_status: str | None = None, now_dt: datetime | None =
     if not fresh:
         status = "warn" if status == "ok" else status
         problems.append(f"age {age_hours:.1f}h > {int(config['max_age_hours'])}h")
-    if not timer_ok:
-        status = "warn" if status == "ok" else status
-        problems.append(f"timer {timer_status}")
 
     details_parts = [
         f"last {backup_dt.isoformat()}",
@@ -630,8 +623,6 @@ def get_backup_status(timer_status: str | None = None, now_dt: datetime | None =
         _human_bytes(stat.st_size),
         integrity["text"],
     ]
-    if timer_status:
-        details_parts.append(f"timer {timer_status}")
     if problems:
         details_parts.append("attention: " + ", ".join(problems))
 
@@ -647,7 +638,6 @@ def get_backup_status(timer_status: str | None = None, now_dt: datetime | None =
         "size_bytes": stat.st_size,
         "integrity_ok": integrity["ok"],
         "integrity": integrity["text"],
-        "timer_status": timer_status or "",
     }
 
 

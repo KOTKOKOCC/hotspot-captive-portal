@@ -6,4 +6,5 @@ After=network.target
 Type=oneshot
 WorkingDirectory=/opt/hotspot-captive-portal
 EnvironmentFile=/opt/hotspot-captive-portal/.env
-ExecStart=/opt/hotspot-captive-portal/.venv/bin/python /opt/hotspot-captive-portal/tools/backup_sqlite.py --dest-dir /opt/hotspot-captive-portal/backups/db --keep 7 --include-env
+ExecStartPre=/bin/sh -c 'for unit in hotspot-captive-portal.service hotspot-cleanup-worker.service hotspot-mikrotik-sync-worker.service; do if systemctl is-active --quiet "$unit"; then echo "$unit is active; stop portal services before manual DB backup"; exit 1; fi; done'
+ExecStart=/opt/hotspot-captive-portal/.venv/bin/python /opt/hotspot-captive-portal/tools/backup_sqlite.py --dest-dir /opt/hotspot-captive-portal/backups/db --keep 1 --include-env

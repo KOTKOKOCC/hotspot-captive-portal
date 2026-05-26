@@ -876,9 +876,9 @@ def check_backup_status() -> None:
             set_setting("backup.dest_dir", str(backup_root))
             set_setting("backup.max_age_hours", 36)
 
-            missing = services.get_backup_status(timer_status="inactive")
-            if missing["status"] != "bad":
-                fail(f"missing backup should be bad, got {missing}")
+            missing = services.get_backup_status()
+            if missing["status"] != "warn":
+                fail(f"missing manual backup should warn, got {missing}")
 
             now_dt = datetime.now(timezone.utc)
             backup_dir = backup_root / "hotspot-db-20260526-033000"
@@ -892,7 +892,7 @@ def check_backup_status() -> None:
             os.utime(backup_dir, (now_dt.timestamp(), now_dt.timestamp()))
             os.utime(backup_db, (now_dt.timestamp(), now_dt.timestamp()))
 
-            healthy = services.get_backup_status(timer_status="active", now_dt=now_dt)
+            healthy = services.get_backup_status(now_dt=now_dt)
             if healthy["status"] != "ok" or not healthy.get("integrity_ok"):
                 fail(f"healthy backup should pass integrity check, got {healthy}")
 
@@ -904,14 +904,14 @@ def check_backup_status() -> None:
             os.utime(broken_dir, (newer_ts, newer_ts))
             os.utime(broken_db, (newer_ts, newer_ts))
 
-            broken = services.get_backup_status(timer_status="active", now_dt=now_dt)
+            broken = services.get_backup_status(now_dt=now_dt)
             if broken["status"] != "bad" or broken.get("integrity_ok"):
                 fail(f"broken backup should fail integrity check, got {broken}")
         finally:
             db_module.DB_PATH = original_db_path
             settings_store.DB_PATH = original_settings_db_path
 
-    ok("backup readiness checks freshness and SQLite integrity without restore")
+    ok("manual backup readiness checks freshness and SQLite integrity without restore")
 
 
 def check_export_jobs() -> None:

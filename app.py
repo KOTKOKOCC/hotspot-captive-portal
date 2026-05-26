@@ -416,7 +416,7 @@ def build_readiness_rows(service_statuses: dict[str, str]) -> str:
     pbx_allowed_ips = csv_setting_items("pbx.allowed_ips", PBX_ALLOWED_IPS)
     retention_config = get_retention_config()
     export_cleanup_config = get_export_file_cleanup_config()
-    backup_status = get_backup_status(service_statuses.get("backup_timer"))
+    backup_status = get_backup_status()
 
     last_radius = get_last_radius_event()
     opera_status = get_opera_fias_status()
@@ -491,7 +491,7 @@ def build_readiness_rows(service_statuses: dict[str, str]) -> str:
         "/admin/system?section=export",
     )
     add(
-        "Database backup",
+        "Manual database backup",
         str(backup_status.get("status") or "warn"),
         str(backup_status.get("details") or "backup status unknown"),
         "/admin/system?section=service",
@@ -531,7 +531,6 @@ def admin_system_service_status_json(request: Request):
         ("mikrotik", "hotspot-mikrotik-sync-worker.service"),
         ("opera", "opera-fias-sync.service"),
         ("freeradius", "freeradius.service"),
-        ("backup_timer", "hotspot-db-backup.timer"),
     ]
 
     return {
@@ -4925,7 +4924,6 @@ def admin_system(request: Request, section: str = "export", password_id: str = "
             ("MikroTik sync", "mikrotik", "hotspot-mikrotik-sync-worker.service"),
             ("Opera FIAS", "opera", "opera-fias-sync.service"),
             ("FreeRADIUS", "freeradius", "freeradius.service"),
-            ("DB backup timer", "backup_timer", "hotspot-db-backup.timer"),
         ]
 
         service_statuses = {

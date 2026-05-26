@@ -156,7 +156,7 @@ def main() -> None:
     parser.add_argument("--db", help="SQLite database path. Defaults to DB_PATH from .env.")
     parser.add_argument("--dest-dir", default="backups/db", help="Directory where timestamped backups are stored.")
     parser.add_argument("--prefix", default="hotspot-db", help="Backup directory prefix.")
-    parser.add_argument("--keep", type=int, default=7, help="How many timestamped backups to keep.")
+    parser.add_argument("--keep", type=int, default=1, help="How many timestamped backups to keep, capped at 2.")
     parser.add_argument("--pages", type=int, default=1024, help="SQLite pages copied per backup step.")
     parser.add_argument("--sleep", type=float, default=0.05, help="Sleep between SQLite backup steps.")
     parser.add_argument("--timeout", type=float, default=30.0, help="SQLite connection timeout in seconds.")
@@ -164,6 +164,7 @@ def main() -> None:
     parser.add_argument("--reserve-mb", type=int, default=1024, help="Extra free space reserve in MB.")
     parser.add_argument("--include-env", action="store_true", help="Copy .env into backup directory as env.snapshot.")
     args = parser.parse_args()
+    args.keep = min(max(int(args.keep), 1), 2)
 
     backup_dir = run_backup(args)
     print(f"Backup directory: {backup_dir}")
