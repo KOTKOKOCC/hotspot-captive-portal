@@ -13,6 +13,9 @@ from config import APP_SECRET, ADMIN_COOKIE
 
 
 ADMIN_SESSION_TTL_SECONDS = int(os.getenv("ADMIN_SESSION_TTL_SECONDS", str(60 * 60 * 8)))
+ADMIN_LOGIN_MAX_FAILURES = int(os.getenv("ADMIN_LOGIN_MAX_FAILURES", "5"))
+ADMIN_LOGIN_WINDOW_SECONDS = int(os.getenv("ADMIN_LOGIN_WINDOW_SECONDS", "600"))
+ADMIN_LOGIN_LOCK_SECONDS = int(os.getenv("ADMIN_LOGIN_LOCK_SECONDS", "900"))
 ADMIN_CSRF_FIELD = "csrf_token"
 
 ROLE_SUPERADMIN = "superadmin"
@@ -194,6 +197,142 @@ def verify_admin_password(password: str, stored_hash: str) -> bool:
         return hmac.compare_digest(check, digest)
     except Exception:
         return False
+
+
+def _admin_login_key(username: str | None) -> str:
+    return str(username or "").strip().lower()
+
+
+def _admin_login_limit(value: int, fallback: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return max(parsed, 0)
+
+
+def _admin_login_limits() -> tuple[int, int, int]:
+    max_failures = _admin_login_limit(ADMIN_LOGIN_MAX_FAILURES, 5)
+    window_seconds = _admin_login_limit(ADMIN_LOGIN_WINDOW_SECONDS, 600)
+    lock_seconds = _admin_login_limit(ADMIN_LOGIN_LOCK_SECONDS, 900)
+    return max_failures, window_seconds, lock_seconds
+
+
+def ensure_admin_login_attempts_table():
+    from db import db
+
+    conn = db()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS admin_login_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            ip TEXT NOT NULL,
+            failed_at INTEGER NOT NULL,
+            reason TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_admin_login_attempts_key_time
+        ON admin_login_attempts(username, ip, failed_at)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_admin_login_attempts_failed_at
+        ON admin_login_attempts(failed_at)
+    """)
+    conn.commit()
+    conn.close()
+
+
+def _cleanup_admin_login_attempts(conn, now_ts: int) -> None:
+    _max_failures, window_seconds, lock_seconds = _admin_login_limits()
+    keep_seconds = max(window_seconds, lock_seconds, 86_400)
+    conn.execute(
+        "DELETE FROM admin_login_attempts WHERE failed_at < ?",
+        (now_ts - keep_seconds,),
+    )
+
+
+def get_admin_login_lock_state(username: str, ip: str, now_ts: int | None = None) -> tuple[bool, int | None, int]:
+    max_failures, window_seconds, lock_seconds = _admin_login_limits()
+    if max_failures <= 0 or window_seconds <= 0 or lock_seconds <= 0:
+        return False, None, 0
+
+    ensure_admin_login_attempts_table()
+    now_value = int(time.time()) if now_ts is None else int(now_ts)
+    username_key = _admin_login_key(username)
+    ip_key = str(ip or "-").strip() or "-"
+    window_start = now_value - window_seconds
+
+    from db import db
+
+    conn = db()
+    try:
+        _cleanup_admin_login_attempts(conn, now_value)
+        rows = conn.execute(
+            """
+            SELECT failed_at
+            FROM admin_login_attempts
+            WHERE username = ?
+              AND ip = ?
+              AND failed_at >= ?
+            ORDER BY failed_at DESC
+            """,
+            (username_key, ip_key, window_start),
+        ).fetchall()
+        conn.commit()
+    finally:
+        conn.close()
+
+    failure_count = len(rows)
+    if failure_count < max_failures:
+        return False, None, failure_count
+
+    lock_until = int(rows[0]["failed_at"]) + lock_seconds
+    if lock_until <= now_value:
+        return False, None, failure_count
+
+    return True, lock_until, failure_count
+
+
+def record_admin_login_failure(username: str, ip: str, reason: str, now_ts: int | None = None) -> tuple[bool, int | None, int]:
+    ensure_admin_login_attempts_table()
+    now_value = int(time.time()) if now_ts is None else int(now_ts)
+    username_key = _admin_login_key(username)
+    ip_key = str(ip or "-").strip() or "-"
+
+    from db import db
+
+    conn = db()
+    try:
+        _cleanup_admin_login_attempts(conn, now_value)
+        conn.execute(
+            """
+            INSERT INTO admin_login_attempts (username, ip, failed_at, reason)
+            VALUES (?, ?, ?, ?)
+            """,
+            (username_key, ip_key, now_value, str(reason or "failed")),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return get_admin_login_lock_state(username_key, ip_key, now_value)
+
+
+def clear_admin_login_failures(username: str, ip: str) -> None:
+    ensure_admin_login_attempts_table()
+    username_key = _admin_login_key(username)
+    ip_key = str(ip or "-").strip() or "-"
+
+    from db import db
+
+    conn = db()
+    conn.execute(
+        "DELETE FROM admin_login_attempts WHERE username = ? AND ip = ?",
+        (username_key, ip_key),
+    )
+    conn.commit()
+    conn.close()
 
 
 def ensure_admin_users_table():

@@ -114,6 +114,10 @@ from admin_auth import (
     role_guard,
     get_current_admin_user,
     ensure_admin_users_table,
+    ensure_admin_login_attempts_table,
+    get_admin_login_lock_state,
+    record_admin_login_failure,
+    clear_admin_login_failures,
     bootstrap_admin_users,
     verify_admin_password,
     hash_admin_password,
@@ -234,6 +238,21 @@ def admin_post_guard(request: Request, allowed_roles: tuple[str, ...], csrf_toke
 
     require_admin_csrf(request, csrf_token)
     return None
+
+
+def admin_login_source_ip(request: Request) -> str:
+    return request.client.host if getattr(request, "client", None) else "-"
+
+
+def audit_admin_login_event(event_type: str, username: str, ip: str, details: str = "") -> None:
+    try:
+        audit(
+            event_type,
+            ip=ip,
+            details=f"username={username or '-'}" + (f" {details}" if details else ""),
+        )
+    except Exception:
+        logger.warning("admin login audit failed", exc_info=True)
 
 
 def ensure_security_default_settings() -> None:
@@ -1726,6 +1745,13 @@ def admin_login_page(error: str = ""):
         </div>
         """
 
+    elif error == "locked":
+        error_html = """
+        <div class="notice error" style="margin-bottom:14px; text-align:center;">
+          Слишком много попыток входа. Попробуйте позже
+        </div>
+        """
+
     return HTMLResponse(f"""
     <!doctype html>
     <html lang="ru">
@@ -1762,6 +1788,18 @@ def admin_login_page(error: str = ""):
 
 @app.post("/admin/login")
 def admin_login(request: Request, username: str = Form(...), password: str = Form(...)):
+    username = str(username or "").strip()
+    source_ip = admin_login_source_ip(request)
+    locked, lock_until, failure_count = get_admin_login_lock_state(username, source_ip)
+    if locked:
+        audit_admin_login_event(
+            "admin_login_blocked",
+            username,
+            source_ip,
+            details=f"failures={failure_count} lock_until={lock_until}",
+        )
+        return RedirectResponse(url="/admin/login?error=locked", status_code=303)
+
     row = fetch_one("""
         SELECT username, password_hash, role, is_active
         FROM admin_users
@@ -1769,13 +1807,61 @@ def admin_login(request: Request, username: str = Form(...), password: str = For
     """, (username,))
 
     if not row:
+        locked, lock_until, failure_count = record_admin_login_failure(username, source_ip, "unknown_user")
+        audit_admin_login_event(
+            "admin_login_failed_unknown_user",
+            username,
+            source_ip,
+            details=f"failures={failure_count}",
+        )
+        if locked:
+            audit_admin_login_event(
+                "admin_login_locked",
+                username,
+                source_ip,
+                details=f"reason=unknown_user failures={failure_count} lock_until={lock_until}",
+            )
+            return RedirectResponse(url="/admin/login?error=locked", status_code=303)
         return RedirectResponse(url="/admin/login?error=bad_credentials", status_code=303)
 
     if int(row["is_active"]) != 1:
+        locked, lock_until, failure_count = record_admin_login_failure(username, source_ip, "disabled_user")
+        audit_admin_login_event(
+            "admin_login_failed_disabled",
+            username,
+            source_ip,
+            details=f"failures={failure_count}",
+        )
+        if locked:
+            audit_admin_login_event(
+                "admin_login_locked",
+                username,
+                source_ip,
+                details=f"reason=disabled_user failures={failure_count} lock_until={lock_until}",
+            )
+            return RedirectResponse(url="/admin/login?error=locked", status_code=303)
         return RedirectResponse(url="/admin/login?error=disabled", status_code=303)
 
     if not verify_admin_password(password, row["password_hash"]):
+        locked, lock_until, failure_count = record_admin_login_failure(username, source_ip, "bad_password")
+        audit_admin_login_event(
+            "admin_login_failed_bad_password",
+            username,
+            source_ip,
+            details=f"failures={failure_count}",
+        )
+        if locked:
+            audit_admin_login_event(
+                "admin_login_locked",
+                username,
+                source_ip,
+                details=f"reason=bad_password failures={failure_count} lock_until={lock_until}",
+            )
+            return RedirectResponse(url="/admin/login?error=locked", status_code=303)
         return RedirectResponse(url="/admin/login?error=bad_credentials", status_code=303)
+
+    clear_admin_login_failures(username, source_ip)
+    audit_admin_login_event("admin_login_success", username, source_ip)
 
     role = normalize_admin_role(row["role"])
     redirect_url = role_home_url(role)
@@ -1905,6 +1991,7 @@ def startup():
     init_opera_sites_table()
     init_export_jobs_table()
     ensure_admin_users_table()
+    ensure_admin_login_attempts_table()
     ensure_guests_auth_columns()
     bootstrap_admin_users()
 

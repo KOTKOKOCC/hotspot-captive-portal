@@ -503,7 +503,9 @@ def check_admin_security_headers_and_cookie() -> None:
         db_module.DB_PATH = str(test_db)
 
         try:
+            app_module.init_db()
             app_module.ensure_admin_users_table()
+            app_module.ensure_admin_login_attempts_table()
             now = datetime.now(timezone.utc).isoformat()
             conn = db_module.db()
             conn.execute(
@@ -558,6 +560,113 @@ def check_admin_security_headers_and_cookie() -> None:
                 os.environ["ADMIN_COOKIE_SECURE"] = original_cookie_secure
 
     ok("admin security headers and cookie flags are hardened")
+
+
+def check_admin_login_rate_limit() -> None:
+    import tempfile
+    from datetime import datetime, timezone
+
+    import app as app_module
+    import db as db_module
+    from admin_auth import ROLE_SUPERADMIN, hash_admin_password
+
+    original_db_path = db_module.DB_PATH
+
+    class FakeClient:
+        def __init__(self, host: str):
+            self.host = host
+
+    class FakeUrl:
+        def __init__(self, path: str, scheme: str = "http"):
+            self.path = path
+            self.scheme = scheme
+
+    class FakeRequest:
+        def __init__(self, host: str):
+            self.url = FakeUrl("/admin/login")
+            self.headers = {}
+            self.cookies = {}
+            self.client = FakeClient(host)
+
+    def location(response) -> str:
+        return response.headers.get("location", "")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        test_db = Path(tmp) / "admin_login_rate.db"
+        db_module.DB_PATH = str(test_db)
+
+        try:
+            app_module.init_db()
+            app_module.ensure_admin_users_table()
+            app_module.ensure_admin_login_attempts_table()
+            now = datetime.now(timezone.utc).isoformat()
+            conn = db_module.db()
+            conn.execute(
+                """
+                INSERT INTO admin_users (
+                    username, password_hash, role, is_active, created_at, updated_at
+                )
+                VALUES (?, ?, ?, 1, ?, ?)
+                """,
+                ("rate_super", hash_admin_password("password"), ROLE_SUPERADMIN, now, now),
+            )
+            conn.commit()
+            conn.close()
+
+            original_audit = app_module.audit
+            app_module.audit = lambda *args, **kwargs: None
+            try:
+                for index in range(4):
+                    response = app_module.admin_login(
+                        FakeRequest("10.10.10.10"),
+                        username="rate_super",
+                        password=f"bad-{index}",
+                    )
+                    if location(response) != "/admin/login?error=bad_credentials":
+                        fail("admin login should allow several bad attempts before lockout")
+
+                locked_response = app_module.admin_login(
+                    FakeRequest("10.10.10.10"),
+                    username="rate_super",
+                    password="bad-final",
+                )
+                if location(locked_response) != "/admin/login?error=locked":
+                    fail("admin login did not lock after repeated bad passwords")
+
+                correct_while_locked = app_module.admin_login(
+                    FakeRequest("10.10.10.10"),
+                    username="rate_super",
+                    password="password",
+                )
+                if location(correct_while_locked) != "/admin/login?error=locked":
+                    fail("admin login accepted a correct password during lockout")
+
+                other_ip_success = app_module.admin_login(
+                    FakeRequest("10.10.10.11"),
+                    username="rate_super",
+                    password="password",
+                )
+                if location(other_ip_success) != "/admin":
+                    fail("admin login rate limit should be scoped to username and IP")
+
+                app_module.clear_admin_login_failures("rate_super", "10.10.10.10")
+                recovered = app_module.admin_login(
+                    FakeRequest("10.10.10.10"),
+                    username="rate_super",
+                    password="password",
+                )
+                if location(recovered) != "/admin":
+                    fail("admin login did not recover after clearing failed attempts")
+            finally:
+                app_module.audit = original_audit
+        finally:
+            db_module.DB_PATH = original_db_path
+
+    locked_html = app_module.admin_login_page(error="locked").body.decode("utf-8")
+    if "Слишком много попыток входа" not in locked_html:
+        fail("admin login page does not explain temporary lockout")
+
+    ok("admin login is rate-limited by username and source IP")
 
 
 def check_opera_lookup_fallback() -> None:
@@ -1366,6 +1475,7 @@ def main() -> None:
     check_admin_role_access_matrix()
     check_admin_csrf_protection()
     check_admin_security_headers_and_cookie()
+    check_admin_login_rate_limit()
     check_opera_lookup_fallback()
     check_optional_api_guard()
     check_internal_api_guards()
