@@ -473,8 +473,7 @@ input[type="submit"] {
 
 .btn:hover,
 button:hover,
-input[type="submit"]:hover,
-form button[type=submit]:hover {
+input[type="submit"]:hover {
   background: rgba(150,155,165,.68);
   transform: translateY(-1px);
 }
@@ -542,8 +541,7 @@ textarea {
   outline: none;
 }
 
-select,
-.toolbar select {
+select {
   appearance: none;
   -webkit-appearance: none;
   overflow: hidden;
@@ -783,12 +781,7 @@ ul.quick-links li {
 
 /* ===== LOGIN ===== */
 
-body.login-page {
-  min-height: 100vh;
-}
-
-.login-wrap,
-body.login-page .login-wrap {
+.login-wrap {
   min-height: 100vh;
   display: flex;
   align-items: center;
@@ -884,10 +877,6 @@ body.login-page .login-card button {
 
 @media (max-width: 900px) {
   .export-form {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .system-actions {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
@@ -1011,15 +1000,8 @@ body.login-page .login-card button {
   }
 
   .stat {
-    pmin-height: 64px;
     padding: 10px 12px;
     border-radius: 16px;
-  }
-
-  .stat-value {
-    font-size: 21px;
-    line-height: 1;
-    margin-top: 2px;
   }
 
   .disk-stat {
@@ -1191,12 +1173,6 @@ body.login-page .login-card button {
 }
 
 /* ===== SETTINGS PAGE FORM TUNING ===== */
-
-.settings-grid {
-  display: grid;
-  gap: 14px;
-  align-items: end;
-}
 
 .settings-grid-mikrotik {
   grid-template-columns: minmax(220px, 1fr) 90px minmax(220px, 1fr) minmax(240px, 1fr) 90px 170px;
@@ -1453,26 +1429,6 @@ body.login-page .login-card button {
 .toolbar > .users-form {
   width: 100%;
   flex: 1 1 100%;
-}
-
-.network-form,
-.users-form {
-  display: grid;
-  gap: 12px;
-  align-items: end;
-}
-
-.network-form {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-}
-
-.users-form {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-}
-
-.network-form > div,
-.users-form > div {
-  min-width: 0;
 }
 
 .network-form input,
